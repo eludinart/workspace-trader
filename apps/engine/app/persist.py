@@ -6,7 +6,10 @@ import json
 import logging
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from app.store import Store
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +54,17 @@ def clear_state() -> None:
             STATE_PATH.unlink()
     except Exception as exc:  # noqa: BLE001
         logger.warning("persist clear failed: %s", exc)
+
+
+def import_json_to_store(store: "Store | None" = None) -> bool:
+    """Import ``paper_state.json`` into Postgres when no account row exists."""
+    from app.store import Store as StoreCls
+
+    st = store if store is not None else StoreCls()
+    data = load_state()
+    if not data:
+        return False
+    return st.import_paper_state(data)
 
 
 def parse_last_buys(raw: dict[str, Any] | None) -> dict[str, datetime]:
