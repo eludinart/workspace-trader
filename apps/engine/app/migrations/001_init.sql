@@ -1,0 +1,88 @@
+CREATE TABLE IF NOT EXISTS schema_migrations (
+  id TEXT PRIMARY KEY,
+  applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS bot_lease (
+  id INT PRIMARY KEY CHECK (id = 1),
+  owner_id TEXT,
+  heartbeat_at TIMESTAMPTZ,
+  expires_at TIMESTAMPTZ,
+  release_requested BOOLEAN NOT NULL DEFAULT false,
+  version BIGINT NOT NULL DEFAULT 0
+);
+INSERT INTO bot_lease (id) VALUES (1) ON CONFLICT DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS account (
+  id INT PRIMARY KEY CHECK (id = 1),
+  mode TEXT NOT NULL DEFAULT 'paper',
+  cash DOUBLE PRECISION NOT NULL,
+  initial_balance DOUBLE PRECISION NOT NULL,
+  realized_pnl DOUBLE PRECISION NOT NULL DEFAULT 0,
+  peak_equity DOUBLE PRECISION NOT NULL,
+  killed BOOLEAN NOT NULL DEFAULT false,
+  kill_reason TEXT,
+  session_started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS positions (
+  symbol TEXT PRIMARY KEY,
+  qty DOUBLE PRECISION NOT NULL,
+  avg_entry DOUBLE PRECISION NOT NULL,
+  stop_pct DOUBLE PRECISION,
+  take_pct DOUBLE PRECISION,
+  exit_meta JSONB NOT NULL DEFAULT '{}'::jsonb,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS trades (
+  id TEXT PRIMARY KEY,
+  symbol TEXT NOT NULL,
+  side TEXT NOT NULL,
+  qty DOUBLE PRECISION NOT NULL,
+  price DOUBLE PRECISION NOT NULL,
+  fee DOUBLE PRECISION NOT NULL DEFAULT 0,
+  ts TIMESTAMPTZ NOT NULL,
+  realized_pnl DOUBLE PRECISION NOT NULL DEFAULT 0,
+  note TEXT
+);
+CREATE INDEX IF NOT EXISTS trades_ts_idx ON trades (ts DESC);
+
+CREATE TABLE IF NOT EXISTS journal (
+  id TEXT PRIMARY KEY,
+  ts TIMESTAMPTZ NOT NULL,
+  payload JSONB NOT NULL
+);
+CREATE INDEX IF NOT EXISTS journal_ts_idx ON journal (ts DESC);
+
+CREATE TABLE IF NOT EXISTS equity_points (
+  ts TIMESTAMPTZ NOT NULL,
+  equity DOUBLE PRECISION NOT NULL,
+  PRIMARY KEY (ts)
+);
+
+CREATE TABLE IF NOT EXISTS bot_params (
+  id INT PRIMARY KEY CHECK (id = 1),
+  params JSONB NOT NULL DEFAULT '{}'::jsonb,
+  alerts JSONB NOT NULL DEFAULT '{}'::jsonb,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+INSERT INTO bot_params (id) VALUES (1) ON CONFLICT DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS runtime_meta (
+  id INT PRIMARY KEY CHECK (id = 1),
+  last_buy_at JSONB NOT NULL DEFAULT '{}'::jsonb,
+  signal_history JSONB NOT NULL DEFAULT '[]'::jsonb,
+  migrated_at TIMESTAMPTZ,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+INSERT INTO runtime_meta (id) VALUES (1) ON CONFLICT DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS control_audit (
+  id BIGSERIAL PRIMARY KEY,
+  ts TIMESTAMPTZ NOT NULL DEFAULT now(),
+  actor TEXT NOT NULL,
+  action TEXT NOT NULL,
+  payload JSONB NOT NULL DEFAULT '{}'::jsonb
+);
