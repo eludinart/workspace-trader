@@ -483,7 +483,11 @@ class TradingRuntime:
             logger.warning("equity ring persist failed: %s", exc)
 
     def equity_curve(self, range_key: str = "1h") -> dict[str, Any]:
-        # Don't force-sample on every poll — price loop already records.
+        # API process (store, no lease): read-only from hydrated Postgres.
+        # Sampling belongs to the trader price loop — recording here polluted
+        # the ring with cash/equity glitches (empty marks / half-hydrated wallet).
+        if self.lease is None and self.store is not None:
+            return self.equity_history.query(range_key)
         if not self.equity_history.dump():
             self._record_equity_sample(force=True)
         else:

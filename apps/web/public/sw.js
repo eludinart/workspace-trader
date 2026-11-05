@@ -1,4 +1,4 @@
-const CACHE = "workspace-trader-static-v2";
+const CACHE = "workspace-trader-static-v3";
 const ASSETS = ["/manifest.webmanifest", "/icon.svg"];
 
 self.addEventListener("install", (event) => {

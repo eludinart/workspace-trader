@@ -54,37 +54,37 @@ const RANGE_OPTIONS: Array<{ id: PaperTimeRange; label: string; hint: string }> 
 
 const VALID_RANGES = new Set<PaperTimeRange>(RANGE_OPTIONS.map((o) => o.id));
 const STORAGE_KEY = "wt.paperChartRange";
-const LAYERS_KEY = "wt.paperChartLayers";
+const LAYERS_KEY = "wt.paperChartLayers.v2";
 
 const W = 900;
-const H = 320;
-const PAD = { top: 28, right: 56, bottom: 40, left: 64 };
+const H = 300;
+const PAD = { top: 24, right: 20, bottom: 36, left: 58 };
+const DISPLAY_CAP = 160;
 
 const COLORS = {
   equity: "#38bdf8",
-  cash: "#c4b5fd",
+  cash: "#a78bfa",
   pnl: "#34d399",
   pnlNeg: "#f87171",
   positions: "#fbbf24",
   drawdown: "#fb7185",
-  grid: "rgba(148,163,184,0.12)",
-  axis: "#64748b",
-  cross: "rgba(226,232,240,0.35)",
+  grid: "rgba(148,163,184,0.10)",
+  cross: "rgba(226,232,240,0.4)",
   panel: "#0b1220",
 } as const;
 
+/** Clean defaults: equity + cash only. DD/P&L/positions off (they made the chart unreadable). */
 const DEFAULT_LAYERS: Record<SeriesKey, boolean> = {
   equity: true,
   cash: true,
   pnl: false,
   positions: false,
-  drawdown: true,
+  drawdown: false,
 };
 
 function loadRange(): PaperTimeRange {
   if (typeof window === "undefined") return "1h";
   const raw = window.localStorage.getItem(STORAGE_KEY);
-  // Legacy alias: 1j was duplicate of 24h.
   if (raw === "1d") return "24h";
   if (raw && VALID_RANGES.has(raw as PaperTimeRange)) return raw as PaperTimeRange;
   return "1h";
@@ -119,32 +119,22 @@ function rangeCutoffMs(range: PaperTimeRange, sessionStartedAt: number | null): 
   return null;
 }
 
-/** X domain always follows the selected time scale (so range buttons actually work). */
-function visibleDomainMs(
+function domainForRange(
   range: PaperTimeRange,
   sessionStartedAt: number | null,
   series: PaperSample[],
-): { start: number; end: number; sparse: boolean } {
+): { start: number; end: number } {
   const end = Date.now();
   const delta = rangeDeltaMs(range);
-  let start: number;
-  if (delta != null) {
-    start = end - delta;
-  } else if (range === "session") {
-    start = sessionStartedAt ?? series[0]?.t ?? end - 3600_000;
-    start = Math.min(start, end - 60_000);
-  } else if (series.length) {
-    start = series[0].t;
-    if (end - start < 60_000) start = end - 60_000;
-  } else {
-    start = end - 3600_000;
+  if (delta != null) return { start: end - delta, end };
+  if (range === "session") {
+    const start = sessionStartedAt ?? series[0]?.t ?? end - 3600_000;
+    return { start: Math.min(start, end - 60_000), end };
   }
-
-  const inWindow = series.filter((s) => s.t >= start && s.t <= end);
-  const dataSpan =
-    inWindow.length >= 2 ? inWindow[inWindow.length - 1].t - inWindow[0].t : 0;
-  const sparse = inWindow.length < 2 || dataSpan < (end - start) * 0.25;
-  return { start, end, sparse };
+  if (series.length) {
+    return { start: Math.min(series[0].t, end - 60_000), end };
+  }
+  return { start: end - 3600_000, end };
 }
 
 function formatAxisTime(t: number, spanMs: number): string {
@@ -154,8 +144,8 @@ function formatAxisTime(t: number, spanMs: number): string {
       : spanMs >= 2 * 24 * 3600_000
         ? { day: "2-digit", month: "2-digit", hour: "2-digit" }
         : spanMs >= 3 * 3600_000
-          ? { hour: "2-digit", minute: "2-digit" }
-          : { hour: "2-digit", minute: "2-digit", second: "2-digit" };
+          ? { day: "2-digit", hour: "2-digit", minute: "2-digit" }
+          : { hour: "2-digit", minute: "2-digit" };
   return new Date(t).toLocaleString("fr-FR", opts);
 }
 
@@ -166,7 +156,38 @@ function fmtPct(v: number, digits = 2): string {
   })} %`;
 }
 
-function niceMoneyTicks(min: number, max: number, count = 5): number[] {
+function windowLabel(range: PaperTimeRange, spanMs: number): string {
+  const hours = spanMs / 3600_000;
+  if (hours < 36) return `${Math.max(1, Math.round(hours))} h`;
+  const days = hours / 24;
+  if (days < 40) return `${Math.round(days)} j`;
+  return RANGE_OPTIONS.find((o) => o.id === range)?.label ?? range;
+}
+
+/** Drop hydrate glitches that collapse the Y axis to 0. */
+function sanitize(samples: PaperSample[]): PaperSample[] {
+  return samples.filter((s) => {
+    if (!Number.isFinite(s.t) || !Number.isFinite(s.equity)) return false;
+    if (s.equity <= 0) return false;
+    // API used to record cash=0 / pnl=0 ghosts with no book.
+    if (s.cash === 0 && s.positions === 0 && s.equity > 10) return false;
+    return true;
+  });
+}
+
+/** Evenly downsample for SVG (keeps first/last). */
+function downsample(samples: PaperSample[], maxOut: number): PaperSample[] {
+  if (samples.length <= maxOut || maxOut < 3) return samples;
+  const out: PaperSample[] = [samples[0]];
+  const step = (samples.length - 1) / (maxOut - 1);
+  for (let i = 1; i < maxOut - 1; i += 1) {
+    out.push(samples[Math.round(i * step)]);
+  }
+  out.push(samples[samples.length - 1]);
+  return out;
+}
+
+function niceMoneyTicks(min: number, max: number, count = 4): number[] {
   const span = Math.max(1e-6, max - min);
   const step = span / Math.max(1, count - 1);
   const magnitude = 10 ** Math.floor(Math.log10(step));
@@ -180,17 +201,12 @@ function niceMoneyTicks(min: number, max: number, count = 5): number[] {
   return ticks.length ? ticks : [min, max];
 }
 
+/** Straight polylines only — cubic beziers scribbled on dense samples. */
 function linePath(points: Array<{ x: number; y: number }>): string {
   if (!points.length) return "";
-  if (points.length === 1) return `M${points[0].x.toFixed(1)},${points[0].y.toFixed(1)}`;
-  let d = `M${points[0].x.toFixed(1)},${points[0].y.toFixed(1)}`;
-  for (let i = 1; i < points.length; i += 1) {
-    const p0 = points[i - 1];
-    const p1 = points[i];
-    const midX = (p0.x + p1.x) / 2;
-    d += ` C${midX.toFixed(1)},${p0.y.toFixed(1)} ${midX.toFixed(1)},${p1.y.toFixed(1)} ${p1.x.toFixed(1)},${p1.y.toFixed(1)}`;
-  }
-  return d;
+  return points
+    .map((p, i) => `${i === 0 ? "M" : "L"}${p.x.toFixed(1)},${p.y.toFixed(1)}`)
+    .join(" ");
 }
 
 function areaPath(points: Array<{ x: number; y: number }>, baselineY: number): string {
@@ -215,7 +231,6 @@ function nearestIndex(series: PaperSample[], t: number): number {
   return best;
 }
 
-/** Live paper session chart with selectable time scale. */
 export function PaperSessionChart({
   equity,
   cash,
@@ -248,15 +263,14 @@ export function PaperSessionChart({
   const pushLiveSample = useCallback(
     (force = false) => {
       const snap = liveRef.current;
-      if (!Number.isFinite(snap.equity) || !Number.isFinite(snap.cash)) return;
+      if (!Number.isFinite(snap.equity) || snap.equity <= 0) return;
       const now = Date.now();
       const prev = lastSample.current;
       const moved =
         !prev ||
         Math.abs(prev.equity - snap.equity) >= 0.05 ||
         Math.abs(prev.cash - snap.cash) >= 0.05 ||
-        prev.positions !== snap.positions ||
-        Math.abs(prev.pnl - snap.pnl) >= 0.05;
+        prev.positions !== snap.positions;
       if (!force && prev && !moved && now - lastPush.current < 2000) return;
 
       const cutoff = rangeCutoffMs(rangeRef.current, sessionStartedAt);
@@ -282,7 +296,7 @@ export function PaperSessionChart({
           base.length && Math.abs(base[base.length - 1].t - sample.t) < 400
             ? base.slice(0, -1)
             : base;
-        const next = [...withoutDup, sample];
+        const next = sanitize([...withoutDup, sample]);
         return next.length > maxPoints ? next.slice(-maxPoints) : next;
       });
     },
@@ -303,14 +317,16 @@ export function PaperSessionChart({
             setSessionStartedAt(ts);
           }
         }
-        const mapped: PaperSample[] = (res.points || []).map((p) => ({
-          t: Date.parse(p.t) || Date.now(),
-          equity: Number(p.equity) || 0,
-          cash: Number(p.cash) || 0,
-          positions: Number(p.positions) || 0,
-          pnl: Number(p.pnl) || 0,
-          drawdownPct: Number(p.drawdown_pct) || 0,
-        }));
+        const mapped = sanitize(
+          (res.points || []).map((p) => ({
+            t: Date.parse(p.t) || Date.now(),
+            equity: Number(p.equity) || 0,
+            cash: Number(p.cash) || 0,
+            positions: Number(p.positions) || 0,
+            pnl: Number(p.pnl) || 0,
+            drawdownPct: Number(p.drawdown_pct) || 0,
+          })),
+        );
         const cutoff = rangeCutoffMs(nextRange, sessionTs ?? sessionStartedAt);
         setSeries((prev) => {
           const byBucket = new Map<number, PaperSample>();
@@ -321,11 +337,10 @@ export function PaperSessionChart({
             if (!existing || p.t >= existing.t) byBucket.set(key, p);
           };
           for (const p of mapped) put(p);
-          // Keep dense live samples inside the new window; drop out-of-range points.
           if (!opts?.replace) {
             for (const p of prev) put(p);
           }
-          const next = [...byBucket.values()].sort((a, b) => a.t - b.t);
+          const next = sanitize([...byBucket.values()].sort((a, b) => a.t - b.t));
           const trimmed = next.length > maxPoints ? next.slice(-maxPoints) : next;
           peakInView.current = trimmed.reduce(
             (m, s) => Math.max(m, s.equity),
@@ -345,12 +360,14 @@ export function PaperSessionChart({
 
   useEffect(() => {
     void applyHistory(range, { replace: true });
-  }, [range]); // eslint-disable-line react-hooks/exhaustive-deps -- only on range change
+    // Intentionally only when range changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [range]);
 
   useEffect(() => {
     const timer = window.setInterval(() => {
       void applyHistory(rangeRef.current, { replace: false });
-    }, 20_000);
+    }, 25_000);
     return () => window.clearInterval(timer);
   }, [applyHistory]);
 
@@ -391,50 +408,54 @@ export function PaperSessionChart({
     pushLiveSample(true);
   }, [equity, cash, positions, pnl, pushLiveSample]);
 
+  const domain = useMemo(
+    () => domainForRange(range, sessionStartedAt, series),
+    [range, sessionStartedAt, series],
+  );
+  const span = Math.max(60_000, domain.end - domain.start);
+
+  const plotRaw = useMemo(() => {
+    return series.filter((s) => s.t >= domain.start - 500 && s.t <= domain.end + 500);
+  }, [series, domain.start, domain.end]);
+
+  const plotSeries = useMemo(() => downsample(plotRaw, DISPLAY_CAP), [plotRaw]);
+
   const latest = series[series.length - 1];
   const chartPnl = latest?.pnl ?? pnl;
   const drawdownPct = latest?.drawdownPct ?? 0;
-  const active = hoverIdx != null ? series[hoverIdx] : latest;
+  const active = hoverIdx != null ? plotSeries[hoverIdx] ?? latest : latest;
 
   const geometry = useMemo(() => {
-    const domain = visibleDomainMs(range, sessionStartedAt, series);
-    const span = Math.max(60_000, domain.end - domain.start);
     const innerW = W - PAD.left - PAD.right;
     const innerH = H - PAD.top - PAD.bottom;
-    const plotSeries = series.filter((s) => s.t >= domain.start - 1000 && s.t <= domain.end + 1000);
 
-    // Left axis = portfolio dollars only (equity + optional cash). Never mix with ~0 P&L.
     const moneyVals: number[] = [];
     if (plotSeries.length) {
       for (const s of plotSeries) {
         moneyVals.push(s.equity);
-        if (layers.cash) moneyVals.push(s.cash);
+        if (layers.cash && s.cash > 0) moneyVals.push(s.cash);
       }
     } else {
-      moneyVals.push(equity, cash);
+      moneyVals.push(equity);
+      if (cash > 0) moneyVals.push(cash);
     }
+
     let minM = Math.min(...moneyVals);
     let maxM = Math.max(...moneyVals);
-    const center = (minM + maxM) / 2;
-    if (maxM - minM < Math.max(2, Math.abs(center) * 0.004)) {
-      const padFlat = Math.max(2, Math.abs(center) * 0.01);
-      minM = center - padFlat;
-      maxM = center + padFlat;
+    const mid = (minM + maxM) / 2;
+    if (maxM - minM < Math.max(1, Math.abs(mid) * 0.008)) {
+      const padFlat = Math.max(3, Math.abs(mid) * 0.015);
+      minM = mid - padFlat;
+      maxM = mid + padFlat;
     } else {
-      const pad = (maxM - minM) * 0.12;
+      const pad = (maxM - minM) * 0.1;
       minM -= pad;
       maxM += pad;
     }
 
     const maxPos = Math.max(1, ...plotSeries.map((s) => s.positions), positions, 1);
-    const maxDd = Math.max(
-      0.5,
-      ...plotSeries.map((s) => s.drawdownPct),
-      drawdownPct,
-      0.5,
-    );
+    const maxDd = Math.max(0.25, ...plotSeries.map((s) => s.drawdownPct), drawdownPct, 0.25);
 
-    // Optional P&L band uses its own normalized overlay near the bottom third when enabled.
     const pnlVals = plotSeries.length ? plotSeries.map((s) => s.pnl) : [pnl];
     let minPnl = Math.min(0, ...pnlVals);
     let maxPnl = Math.max(0, ...pnlVals);
@@ -448,13 +469,9 @@ export function PaperSessionChart({
       return PAD.left + ((clamped - domain.start) / span) * innerW;
     };
     const yMoney = (v: number) => PAD.top + ((maxM - v) / (maxM - minM)) * innerH;
-    const yPos = (v: number) => PAD.top + ((maxPos - v) / maxPos) * innerH * 0.85 + innerH * 0.08;
+    const yPos = (v: number) => PAD.top + ((maxPos - v) / maxPos) * innerH;
     const yDd = (v: number) => PAD.top + (v / maxDd) * innerH;
-    const yPnl = (v: number) => {
-      const top = PAD.top + innerH * 0.55;
-      const h = innerH * 0.4;
-      return top + ((maxPnl - v) / (maxPnl - minPnl)) * h;
-    };
+    const yPnl = (v: number) => PAD.top + ((maxPnl - v) / (maxPnl - minPnl)) * innerH;
 
     const equityPts = plotSeries.map((s) => ({ x: xAtTime(s.t), y: yMoney(s.equity) }));
     const cashPts = plotSeries.map((s) => ({ x: xAtTime(s.t), y: yMoney(s.cash) }));
@@ -462,87 +479,67 @@ export function PaperSessionChart({
     const posPts = plotSeries.map((s) => ({ x: xAtTime(s.t), y: yPos(s.positions) }));
     const ddPts = plotSeries.map((s) => ({ x: xAtTime(s.t), y: yDd(s.drawdownPct) }));
 
-    const moneyTicks = niceMoneyTicks(minM, maxM, 5).map((v) => ({
+    const moneyTicks = niceMoneyTicks(minM, maxM, 4).map((v) => ({
       y: yMoney(v),
-      label: money(v, v >= 100 || v <= -100 ? 0 : 2),
+      label: money(v, Math.abs(v) >= 100 ? 0 : 2),
       value: v,
     }));
 
-    const ddTicks =
-      layers.drawdown
-        ? [0, 0.5, 1].map((f) => {
-            const v = f * maxDd;
-            return { y: yDd(v), label: fmtPct(v, v < 1 ? 1 : 0) };
-          })
-        : [];
-
     const timeTicks = [0, 0.5, 1].map((f) => {
       const t = domain.start + span * f;
-      return {
-        x: PAD.left + innerW * f,
-        label: formatAxisTime(t, span),
-      };
+      return { x: PAD.left + innerW * f, label: formatAxisTime(t, span) };
     });
 
     return {
-      domain,
-      span,
-      innerW,
-      innerH,
       equityPts,
       cashPts,
       pnlPts,
       posPts,
       ddPts,
       moneyTicks,
-      ddTicks,
       timeTicks,
       baselineY: PAD.top + innerH,
-      zeroPnlY: yPnl(0),
+      innerW,
+      innerH,
       xAtTime,
       yMoney,
-      yPnl,
-      yPos,
-      yDd,
-      pointCount: series.length,
-      hasSeries: series.length >= 1,
-      sparse: domain.sparse,
+      pointCount: plotSeries.length,
+      rawCount: plotRaw.length,
+      hasSeries: plotSeries.length >= 1,
+      sparse: plotRaw.length < 3 || (plotRaw.length >= 2 && plotRaw[plotRaw.length - 1].t - plotRaw[0].t < span * 0.2),
       pnlPositive: chartPnl >= 0,
     };
   }, [
-    series,
+    plotSeries,
+    plotRaw.length,
     chartPnl,
     drawdownPct,
-    range,
-    sessionStartedAt,
+    domain,
+    span,
     equity,
     cash,
     pnl,
     positions,
     layers.cash,
-    layers.drawdown,
   ]);
 
   function onPointerMove(e: ReactPointerEvent<SVGSVGElement>) {
-    if (!series.length || !svgRef.current) return;
+    if (!plotSeries.length || !svgRef.current) return;
     const rect = svgRef.current.getBoundingClientRect();
     const x = ((e.clientX - rect.left) / rect.width) * W;
-    const t =
-      geometry.domain.start +
-      ((x - PAD.left) / Math.max(1, geometry.innerW)) * geometry.span;
-    const idx = nearestIndex(series, t);
+    const t = domain.start + ((x - PAD.left) / Math.max(1, geometry.innerW)) * span;
+    const idx = nearestIndex(plotSeries, t);
     if (idx >= 0) setHoverIdx(idx);
   }
 
-  const hoverSample = hoverIdx != null ? series[hoverIdx] : null;
-  const hoverX =
-    hoverSample != null ? geometry.xAtTime(hoverSample.t) : null;
+  const hoverSample = hoverIdx != null ? plotSeries[hoverIdx] : null;
+  const hoverX = hoverSample != null ? geometry.xAtTime(hoverSample.t) : null;
 
   return (
     <section className="card overflow-hidden">
-      <div className="mb-4 flex flex-wrap items-start justify-between gap-3">
+      <div className="mb-3 flex flex-wrap items-start justify-between gap-3">
         <div>
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
             <h2 className="text-lg font-medium tracking-tight">Paper — session live</h2>
             {live ? (
               <span className="inline-flex items-center gap-1.5 rounded-full bg-gain/15 px-2.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-gain">
@@ -556,7 +553,10 @@ export function PaperSessionChart({
             )}
           </div>
           <p className="mt-0.5 text-xs text-muted">
-            Courbe portfolio · survol pour le détail · calques à droite
+            Fenêtre <span className="text-slate-300">{windowLabel(range, span)}</span>
+            {" · "}
+            equity {layers.cash ? "+ cash" : ""}
+            {geometry.sparse ? " · données encore courtes sur cette échelle" : ""}
           </p>
         </div>
         <div
@@ -571,11 +571,11 @@ export function PaperSessionChart({
                 key={opt.id}
                 type="button"
                 title={opt.hint}
-                disabled={loadingHistory}
+                disabled={loadingHistory && activeRange}
                 onClick={() => changeRange(opt.id)}
                 className={
                   activeRange
-                    ? "rounded-lg bg-sky-500/30 px-2.5 py-1.5 text-xs font-semibold text-sky-100 shadow-sm shadow-sky-900/30"
+                    ? "rounded-lg bg-sky-500/30 px-2.5 py-1.5 text-xs font-semibold text-sky-100"
                     : "rounded-lg px-2.5 py-1.5 text-xs text-muted hover:bg-slate-700/40 hover:text-slate-200"
                 }
               >
@@ -586,7 +586,7 @@ export function PaperSessionChart({
         </div>
       </div>
 
-      <div className="mb-4 grid grid-cols-2 gap-2 sm:grid-cols-5">
+      <div className="mb-3 grid grid-cols-2 gap-2 sm:grid-cols-5">
         <Metric
           label="Equity"
           value={`${money(active?.equity ?? equity)} $`}
@@ -621,11 +621,9 @@ export function PaperSessionChart({
         />
       </div>
 
-      {historyError ? (
-        <p className="mb-2 text-xs text-orange-300">{historyError}</p>
-      ) : null}
+      {historyError ? <p className="mb-2 text-xs text-orange-300">{historyError}</p> : null}
 
-      <div className="relative rounded-xl border border-line/50 bg-gradient-to-b from-slate-950/80 to-ink/90 p-2 sm:p-3">
+      <div className="relative rounded-xl border border-line/50 bg-gradient-to-b from-slate-950/70 to-ink/90 p-2 sm:p-3">
         <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
           <div className="flex flex-wrap gap-1.5">
             {(
@@ -633,24 +631,22 @@ export function PaperSessionChart({
                 ["equity", "Equity", COLORS.equity],
                 ["cash", "Cash", COLORS.cash],
                 ["pnl", "P&L", chartPnl >= 0 ? COLORS.pnl : COLORS.pnlNeg],
-                ["positions", "Positions", COLORS.positions],
+                ["positions", "Pos.", COLORS.positions],
                 ["drawdown", "DD %", COLORS.drawdown],
               ] as Array<[SeriesKey, string, string]>
             ).map(([key, label, color]) => {
               const on = layers[key];
-              const locked = key === "equity";
               return (
                 <button
                   key={key}
                   type="button"
-                  disabled={locked}
+                  disabled={key === "equity"}
                   onClick={() => toggleLayer(key)}
                   className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] font-medium transition ${
                     on
                       ? "border-white/15 bg-white/5 text-slate-100"
-                      : "border-transparent text-muted opacity-55 hover:opacity-80"
+                      : "border-transparent text-muted opacity-50 hover:opacity-80"
                   }`}
-                  title={locked ? "Toujours visible" : on ? "Masquer" : "Afficher"}
                 >
                   <span
                     className="h-2 w-2 rounded-full"
@@ -662,41 +658,30 @@ export function PaperSessionChart({
             })}
           </div>
           <p className="text-[11px] tabular-nums text-muted">
-            {loadingHistory ? "Maj…" : `${series.length} pts`}
-            {geometry.sparse ? " · historique encore court" : ""} ·{" "}
-            {RANGE_OPTIONS.find((o) => o.id === range)?.label ?? range}
-            {hoverSample
-              ? ` · ${formatAxisTime(hoverSample.t, geometry.span)}`
-              : ""}
+            {loadingHistory ? "Maj…" : `${geometry.rawCount} pts`}
+            {hoverSample ? ` · ${formatAxisTime(hoverSample.t, span)}` : ""}
           </p>
         </div>
 
         {loadingHistory && !geometry.hasSeries ? (
-          <div className="flex h-[320px] items-center justify-center text-sm text-muted">
-            Chargement de la courbe…
+          <div className="flex h-[300px] items-center justify-center text-sm text-muted">
+            Chargement…
           </div>
         ) : (
           <svg
             ref={svgRef}
             viewBox={`0 0 ${W} ${H}`}
-            className="h-auto w-full touch-pan-y"
+            className="h-auto w-full"
             role="img"
-            aria-label={`Évolution paper sur ${range}`}
+            aria-label={`Paper ${range}`}
             onPointerMove={onPointerMove}
             onPointerLeave={() => setHoverIdx(null)}
           >
             <defs>
-              <linearGradient id="equityFill" x1="0" y1="0" x2="0" y2="1">
-                <stop offset="0%" stopColor={COLORS.equity} stopOpacity="0.35" />
+              <linearGradient id="eqFill" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stopColor={COLORS.equity} stopOpacity="0.28" />
                 <stop offset="100%" stopColor={COLORS.equity} stopOpacity="0.02" />
               </linearGradient>
-              <filter id="softGlow" x="-20%" y="-20%" width="140%" height="140%">
-                <feGaussianBlur stdDeviation="2.2" result="blur" />
-                <feMerge>
-                  <feMergeNode in="blur" />
-                  <feMergeNode in="SourceGraphic" />
-                </feMerge>
-              </filter>
             </defs>
 
             {geometry.moneyTicks.map((g) => (
@@ -722,78 +707,36 @@ export function PaperSessionChart({
               </g>
             ))}
 
-            {layers.drawdown
-              ? geometry.ddTicks.map((g, i) => (
-                  <text
-                    key={`dd-${i}-${g.label}`}
-                    x={W - PAD.right + 8}
-                    y={g.y + 3}
-                    textAnchor="start"
-                    fill={COLORS.drawdown}
-                    fontSize={10}
-                    opacity={0.85}
-                    fontFamily="ui-monospace, SFMono-Regular, Menlo, monospace"
-                  >
-                    {g.label}
-                  </text>
-                ))
-              : null}
-
-            {layers.drawdown ? (
-              <text
-                x={W - PAD.right + 8}
-                y={PAD.top - 10}
-                textAnchor="start"
-                fill={COLORS.drawdown}
-                fontSize={9}
-                opacity={0.7}
-              >
-                DD
-              </text>
-            ) : null}
-
-            {layers.positions && geometry.pointCount > 0 ? (
+            {layers.positions && geometry.pointCount > 1 ? (
               <path
                 d={linePath(geometry.posPts)}
                 fill="none"
                 stroke={COLORS.positions}
-                strokeWidth={1.5}
-                strokeDasharray="4 4"
-                opacity={0.7}
+                strokeWidth={1.25}
+                strokeDasharray="4 3"
+                opacity={0.65}
               />
             ) : null}
 
-            {layers.drawdown && geometry.pointCount > 0 ? (
+            {layers.drawdown && geometry.pointCount > 1 ? (
               <path
                 d={linePath(geometry.ddPts)}
                 fill="none"
                 stroke={COLORS.drawdown}
-                strokeWidth={1.75}
+                strokeWidth={1.25}
                 strokeDasharray="5 3"
-                opacity={0.85}
+                opacity={0.75}
               />
             ) : null}
 
-            {layers.pnl && geometry.pointCount > 0 ? (
-              <>
-                <line
-                  x1={PAD.left}
-                  x2={W - PAD.right}
-                  y1={geometry.zeroPnlY}
-                  y2={geometry.zeroPnlY}
-                  stroke={COLORS.axis}
-                  strokeDasharray="3 4"
-                  strokeWidth={1}
-                  opacity={0.5}
-                />
-                <path
-                  d={linePath(geometry.pnlPts)}
-                  fill="none"
-                  stroke={geometry.pnlPositive ? COLORS.pnl : COLORS.pnlNeg}
-                  strokeWidth={1.75}
-                  opacity={0.9}
-                />
-              </>
+            {layers.pnl && geometry.pointCount > 1 ? (
+              <path
+                d={linePath(geometry.pnlPts)}
+                fill="none"
+                stroke={geometry.pnlPositive ? COLORS.pnl : COLORS.pnlNeg}
+                strokeWidth={1.5}
+                opacity={0.85}
+              />
             ) : null}
 
             {layers.cash && geometry.pointCount > 0 ? (
@@ -801,51 +744,34 @@ export function PaperSessionChart({
                 d={linePath(geometry.cashPts)}
                 fill="none"
                 stroke={COLORS.cash}
-                strokeWidth={2}
-                opacity={0.9}
+                strokeWidth={1.75}
+                strokeLinejoin="round"
+                strokeLinecap="round"
               />
             ) : null}
 
             {geometry.pointCount > 0 ? (
               <>
-                <path
-                  d={areaPath(geometry.equityPts, geometry.baselineY)}
-                  fill="url(#equityFill)"
-                />
+                {geometry.pointCount > 1 ? (
+                  <path d={areaPath(geometry.equityPts, geometry.baselineY)} fill="url(#eqFill)" />
+                ) : null}
                 <path
                   d={linePath(geometry.equityPts)}
                   fill="none"
                   stroke={COLORS.equity}
-                  strokeWidth={2.6}
-                  filter="url(#softGlow)"
+                  strokeWidth={2.4}
                   strokeLinejoin="round"
                   strokeLinecap="round"
                 />
-              </>
-            ) : null}
-
-            {geometry.pointCount === 1 && geometry.equityPts[0] ? (
-              <circle
-                cx={geometry.equityPts[0].x}
-                cy={geometry.equityPts[0].y}
-                r={5}
-                fill={COLORS.equity}
-                stroke={COLORS.panel}
-                strokeWidth={2}
-              />
-            ) : null}
-
-            {geometry.equityPts.length > 0 ? (
-              <g>
                 <circle
                   cx={geometry.equityPts[geometry.equityPts.length - 1].x}
                   cy={geometry.equityPts[geometry.equityPts.length - 1].y}
-                  r={4.5}
+                  r={4}
                   fill={COLORS.equity}
                   stroke={COLORS.panel}
                   strokeWidth={2}
                 />
-              </g>
+              </>
             ) : null}
 
             {hoverX != null && hoverSample ? (
@@ -861,66 +787,20 @@ export function PaperSessionChart({
                 <circle
                   cx={hoverX}
                   cy={geometry.yMoney(hoverSample.equity)}
-                  r={5}
+                  r={4.5}
                   fill={COLORS.equity}
                   stroke="#fff"
                   strokeWidth={1.5}
                 />
-                <rect
-                  x={Math.min(hoverX + 12, W - PAD.right - 150)}
-                  y={PAD.top + 4}
-                  width={138}
-                  height={74}
-                  rx={8}
-                  fill="rgba(15,23,42,0.92)"
-                  stroke="rgba(148,163,184,0.25)"
-                />
-                <text
-                  x={Math.min(hoverX + 12, W - PAD.right - 150) + 10}
-                  y={PAD.top + 22}
-                  fill="#e2e8f0"
-                  fontSize={10}
-                  fontFamily="ui-monospace, SFMono-Regular, Menlo, monospace"
-                >
-                  {formatAxisTime(hoverSample.t, geometry.span)}
-                </text>
-                <text
-                  x={Math.min(hoverX + 12, W - PAD.right - 150) + 10}
-                  y={PAD.top + 40}
-                  fill={COLORS.equity}
-                  fontSize={11}
-                  fontFamily="ui-monospace, SFMono-Regular, Menlo, monospace"
-                >
-                  Eq {money(hoverSample.equity)} $
-                </text>
-                <text
-                  x={Math.min(hoverX + 12, W - PAD.right - 150) + 10}
-                  y={PAD.top + 56}
-                  fill={COLORS.cash}
-                  fontSize={11}
-                  fontFamily="ui-monospace, SFMono-Regular, Menlo, monospace"
-                >
-                  Cash {money(hoverSample.cash)} $
-                </text>
-                <text
-                  x={Math.min(hoverX + 12, W - PAD.right - 150) + 10}
-                  y={PAD.top + 72}
-                  fill={hoverSample.pnl >= 0 ? COLORS.pnl : COLORS.pnlNeg}
-                  fontSize={11}
-                  fontFamily="ui-monospace, SFMono-Regular, Menlo, monospace"
-                >
-                  P&L {hoverSample.pnl >= 0 ? "+" : ""}
-                  {money(hoverSample.pnl)} $
-                </text>
               </g>
             ) : null}
 
             {geometry.timeTicks.map((tick, i) => (
               <text
-                key={`t-${tick.x}-${tick.label}`}
+                key={`t-${i}-${tick.label}`}
                 x={tick.x}
-                y={H - 12}
-                textAnchor={i === 0 ? "start" : i === geometry.timeTicks.length - 1 ? "end" : "middle"}
+                y={H - 10}
+                textAnchor={i === 0 ? "start" : i === 2 ? "end" : "middle"}
                 fill="#94a3b8"
                 fontSize={10}
                 fontFamily="ui-monospace, SFMono-Regular, Menlo, monospace"
@@ -929,7 +809,6 @@ export function PaperSessionChart({
               </text>
             ))}
 
-            {/* Invisible hit area */}
             <rect
               x={PAD.left}
               y={PAD.top}
