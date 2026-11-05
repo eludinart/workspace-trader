@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
@@ -117,6 +118,7 @@ class TradingRuntime:
         # Last known signal snapshot per universe symbol (for UI table).
         self._universe_signals: dict[str, dict[str, Any]] = {}
         self.equity_history = EquityHistory()
+        self._last_equity_persist_mono: float = 0.0
         if store is None:
             self._restore_persisted_state()
 
@@ -436,17 +438,19 @@ class TradingRuntime:
                         closed = await asyncio.to_thread(self._apply_pending_closes)
                 except (LeaseLost, PersistenceError) as exc:
                     logger.error("pending close failed: %s", exc)
-                self._record_equity_sample()
+                recorded = self._record_equity_sample()
+                if recorded:
+                    await asyncio.to_thread(self._maybe_persist_equity_ring)
                 await self.publish_live("close" if closed else "price")
             except Exception as exc:  # noqa: BLE001
                 logger.warning("price loop: %s", exc)
             await asyncio.sleep(2)
 
-    def _record_equity_sample(self, *, force: bool = False) -> None:
+    def _record_equity_sample(self, *, force: bool = False) -> bool:
         try:
             eq = self._equity()
             self.peak_equity = max(self.peak_equity, eq)
-            self.equity_history.maybe_record(
+            return self.equity_history.maybe_record(
                 equity=eq,
                 cash=float(self.wallet.cash),
                 positions=len(self.wallet.positions),
@@ -456,6 +460,27 @@ class TradingRuntime:
             )
         except Exception as exc:  # noqa: BLE001
             logger.debug("equity sample skipped: %s", exc)
+            return False
+
+    def _maybe_persist_equity_ring(self) -> None:
+        """Push dense equity samples to Postgres so the API chart stays full."""
+        if self.store is None or self.lease is None:
+            return
+        try:
+            if not self._confirm_lease(respect_release=False):
+                return
+        except Exception:  # noqa: BLE001
+            return
+
+        now = time.monotonic()
+        if self._last_equity_persist_mono and now - self._last_equity_persist_mono < 20.0:
+            return
+        try:
+            self.store.save_equity_only(self)
+            self._last_equity_persist_mono = now
+            self._db_ok = True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("equity ring persist failed: %s", exc)
 
     def equity_curve(self, range_key: str = "1h") -> dict[str, Any]:
         # Don't force-sample on every poll — price loop already records.

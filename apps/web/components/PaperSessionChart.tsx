@@ -319,16 +319,23 @@ export function PaperSessionChart({
           drawdownPct: Number(p.drawdown_pct) || 0,
         }));
         setSeries((prev) => {
-          const lastHistT = mapped.length ? mapped[mapped.length - 1].t : 0;
-          const liveTail = prev.filter((p) => p.t > lastHistT + 250);
-          const merged = [...mapped, ...liveTail];
-          const next = merged.length ? merged : prev;
-          peakInView.current = next.reduce(
+          // Union by ~2s buckets so a sparse API refresh never wipes dense live samples.
+          const byBucket = new Map<number, PaperSample>();
+          const put = (p: PaperSample) => {
+            const key = Math.round(p.t / 2000);
+            const existing = byBucket.get(key);
+            if (!existing || p.t >= existing.t) byBucket.set(key, p);
+          };
+          for (const p of mapped) put(p);
+          for (const p of prev) put(p);
+          const next = [...byBucket.values()].sort((a, b) => a.t - b.t);
+          const trimmed = next.length > maxPoints ? next.slice(-maxPoints) : next;
+          peakInView.current = trimmed.reduce(
             (m, s) => Math.max(m, s.equity),
-            next[0]?.equity ?? liveRef.current.equity,
+            trimmed[0]?.equity ?? liveRef.current.equity,
           );
-          lastSample.current = next[next.length - 1] ?? null;
-          return next.length > maxPoints ? next.slice(-maxPoints) : next;
+          lastSample.current = trimmed[trimmed.length - 1] ?? null;
+          return trimmed;
         });
       } catch (err) {
         setHistoryError(err instanceof Error ? err.message : "Historique indisponible");
@@ -346,7 +353,7 @@ export function PaperSessionChart({
   useEffect(() => {
     const timer = window.setInterval(() => {
       void applyHistory(rangeRef.current);
-    }, 45_000);
+    }, 20_000);
     return () => window.clearInterval(timer);
   }, [applyHistory]);
 

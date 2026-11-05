@@ -20,12 +20,12 @@ _RANGE_DELTA: dict[str, timedelta | None] = {
     "all": None,
 }
 
-# ~7 days at 30s cadence, or denser if values move often.
-_MAX_POINTS = 20_000
-_MIN_INTERVAL_SEC = 15.0
-_SPARSE_INTERVAL_SEC = 5.0
-_SPARSE_UNTIL = 40
-_MATERIAL_EQUITY = 0.25
+# Keep a dense ring for charts: ~2s while warming up, then ~5s steady.
+_MAX_POINTS = 40_000
+_MIN_INTERVAL_SEC = 5.0
+_WARMUP_INTERVAL_SEC = 2.0
+_WARMUP_UNTIL = 180
+_MATERIAL_EQUITY = 0.15
 
 
 class EquityHistory:
@@ -59,9 +59,10 @@ class EquityHistory:
                 or abs(float(equity) - float(self._last_equity)) >= _MATERIAL_EQUITY
             )
             min_interval = (
-                _SPARSE_INTERVAL_SEC if len(self._points) < _SPARSE_UNTIL else _MIN_INTERVAL_SEC
+                _WARMUP_INTERVAL_SEC if len(self._points) < _WARMUP_UNTIL else _MIN_INTERVAL_SEC
             )
-            if elapsed < min_interval and not moved:
+            # Always keep a heartbeat sample on the interval — not only on moves.
+            if elapsed < min_interval and not (moved and elapsed >= 1.0):
                 return False
         peak = float(peak_equity) if peak_equity > 0 else float(equity)
         dd = ((peak - float(equity)) / peak * 100.0) if peak > 0 else 0.0
@@ -91,14 +92,18 @@ class EquityHistory:
             if not isinstance(row, dict):
                 continue
             try:
+                equity = float(row["equity"])
+                cash = float(row["cash"]) if row.get("cash") is not None else equity
                 self._points.append(
                     {
                         "t": str(row["t"]),
-                        "equity": float(row["equity"]),
-                        "cash": float(row["cash"]),
+                        "equity": equity,
+                        "cash": cash,
                         "positions": int(row.get("positions") or 0),
-                        "pnl": float(row.get("pnl") or 0),
-                        "drawdown_pct": float(row.get("drawdown_pct") or 0),
+                        "pnl": float(row["pnl"]) if row.get("pnl") is not None else 0.0,
+                        "drawdown_pct": (
+                            float(row["drawdown_pct"]) if row.get("drawdown_pct") is not None else 0.0
+                        ),
                     }
                 )
             except (KeyError, TypeError, ValueError):
@@ -114,7 +119,7 @@ class EquityHistory:
     def dump(self) -> list[dict[str, Any]]:
         return list(self._points)
 
-    def query(self, range_key: str = "1h", max_out: int = 360) -> dict[str, Any]:
+    def query(self, range_key: str = "1h", max_out: int | None = None) -> dict[str, Any]:
         key = range_key if range_key in _RANGE_DELTA else "1h"
         now = datetime.now(timezone.utc)
         delta = _RANGE_DELTA[key]
@@ -124,6 +129,17 @@ class EquityHistory:
             start = None
         else:
             start = now - delta
+
+        # Keep charts dense: ~1 pt / 5s for 1h ≈ 720; cap longer windows.
+        if max_out is None:
+            if key in {"1h", "6h"}:
+                max_out = 900
+            elif key in {"24h", "1d"}:
+                max_out = 720
+            elif key in {"1w", "session"}:
+                max_out = 600
+            else:
+                max_out = 480
 
         selected: list[dict[str, Any]] = []
         for point in self._points:

@@ -71,6 +71,10 @@ CREATE TABLE IF NOT EXISTS journal (
 CREATE TABLE IF NOT EXISTS equity_points (
   ts TEXT NOT NULL,
   equity REAL NOT NULL,
+  cash REAL,
+  positions INTEGER,
+  pnl REAL,
+  drawdown_pct REAL,
   PRIMARY KEY (ts)
 );
 

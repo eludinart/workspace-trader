@@ -154,14 +154,28 @@ class Store:
                 runtime.journal = DecisionJournal()
                 runtime.journal.load_dicts(journal_rows)
 
-                cur.execute("SELECT ts, equity FROM equity_points ORDER BY ts")
-                eq_rows = [
-                    {
+                cur.execute(
+                    """
+                    SELECT ts, equity, cash, positions, pnl, drawdown_pct
+                    FROM equity_points
+                    ORDER BY ts
+                    """
+                )
+                eq_rows = []
+                for ts, eq, cash, positions, pnl, drawdown in cur.fetchall():
+                    item: dict[str, Any] = {
                         "t": (ts.isoformat() if isinstance(ts, datetime) else str(ts)),
                         "equity": float(eq),
                     }
-                    for ts, eq in cur.fetchall()
-                ]
+                    if cash is not None:
+                        item["cash"] = float(cash)
+                    if positions is not None:
+                        item["positions"] = int(positions)
+                    if pnl is not None:
+                        item["pnl"] = float(pnl)
+                    if drawdown is not None:
+                        item["drawdown_pct"] = float(drawdown)
+                    eq_rows.append(item)
                 session_iso = (
                     session_started_at.isoformat()
                     if isinstance(session_started_at, datetime)
@@ -196,6 +210,27 @@ class Store:
                     self._replace_journal(cur, runtime)
                     self._replace_equity_points(cur, runtime)
                     self._upsert_runtime_meta(cur, runtime)
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+    def save_equity_only(self, runtime: TradingRuntime) -> None:
+        """Flush the equity ring buffer without rewriting the whole book."""
+        with get_conn() as conn:
+            try:
+                with conn.cursor() as cur:
+                    self._replace_equity_points(cur, runtime)
+                    # Keep session start aligned for chart windows.
+                    session_started = runtime.equity_history.session_started_at
+                    cur.execute(
+                        """
+                        UPDATE account
+                        SET session_started_at = %s, updated_at = CURRENT_TIMESTAMP
+                        WHERE id = %s
+                        """,
+                        (session_started, _SINGLETON_ID),
+                    )
                 conn.commit()
             except Exception:
                 conn.rollback()
@@ -519,11 +554,26 @@ class Store:
             try:
                 ts = _parse_ts(str(point.get("t")))
                 equity = float(point["equity"])
+                cash = float(point["cash"]) if point.get("cash") is not None else None
+                positions = int(point["positions"]) if point.get("positions") is not None else None
+                pnl = float(point["pnl"]) if point.get("pnl") is not None else None
+                drawdown = (
+                    float(point["drawdown_pct"]) if point.get("drawdown_pct") is not None else None
+                )
             except (KeyError, TypeError, ValueError):
                 continue
             cur.execute(
-                "INSERT INTO equity_points (ts, equity) VALUES (%s, %s) ON CONFLICT (ts) DO NOTHING",
-                (ts, equity),
+                """
+                INSERT INTO equity_points (ts, equity, cash, positions, pnl, drawdown_pct)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                ON CONFLICT (ts) DO UPDATE SET
+                  equity = EXCLUDED.equity,
+                  cash = EXCLUDED.cash,
+                  positions = EXCLUDED.positions,
+                  pnl = EXCLUDED.pnl,
+                  drawdown_pct = EXCLUDED.drawdown_pct
+                """,
+                (ts, equity, cash, positions, pnl, drawdown),
             )
 
     def _upsert_runtime_meta(self, cur, runtime: TradingRuntime) -> None:
