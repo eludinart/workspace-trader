@@ -1,0 +1,1212 @@
+from __future__ import annotations
+
+import asyncio
+import logging
+from datetime import datetime, timezone
+from typing import Any
+
+from app.alerts import AlertService
+from app.config import AlertParams, BotParams
+from app.events import EventBus
+from app.execution import OrderPlan, buy_spend, cooldown_active, plan_protective, plan_signal
+from app.journal import DecisionJournal
+from app.market.coinbase import CoinbaseClient
+from app.narrative import decision_narrative, format_other_exits, thresholds_from_detail
+from app.news.service import NewsService
+from app.equity_history import EquityHistory
+from app.persist import STATE_PATH, clear_state, load_state, parse_last_buys, save_state
+from app.risk import (
+    annotate_levels,
+    compute_exit_levels,
+    dynamic_max_open,
+    portfolio_open_risk_r,
+    risk_position_spend,
+    sell_is_net_positive,
+)
+from app.strategy.features import build_feature_frame
+from app.strategy.xgboost_strategy import SignalResult, XGBoostStrategy
+from app.trading_style import apply_style_preset, normalize_style, scan_gates
+from app.universe import UniverseService
+from app.wallet import PaperWallet, Trade
+
+logger = logging.getLogger(__name__)
+
+_NOTE_REASONS = {
+    "exit:tp": "tp",
+    "exit:sl": "sl",
+    "exit:kill": "kill",
+    "entry:signal": "signal",
+    "exit:signal": "signal",
+    "hold:budget": "budget",
+    "hold:cooldown": "cooldown",
+    "hold:flat": "flat",
+    "hold:max_size": "max_size",
+    "hold:max_symbols": "max_symbols",
+    "hold:fee_guard": "fee_guard",
+    "hold:min_hold": "min_hold",
+    "hold:portfolio_risk": "portfolio_risk",
+}
+
+
+def _plan_from_note(side: str, note: str) -> OrderPlan:
+    reason = _NOTE_REASONS.get(note, "signal")
+    fraction = 1.0 if side == "sell" else 0.0
+    return OrderPlan(side, fraction, reason, note)
+
+
+class TradingRuntime:
+    def __init__(self) -> None:
+        self.params = BotParams()
+        self.wallet = PaperWallet(initial_balance=self.params.initial_balance)
+        self.market = CoinbaseClient()
+        self.strategy = XGBoostStrategy()
+        self.news = NewsService()
+        self.alerts = AlertService()
+        self.journal = DecisionJournal()
+        self.bus = EventBus()
+        self.running = False
+        self.stream_alive = False
+        self.killed = False
+        self.kill_reason: str | None = None
+        self.peak_equity: float = self.params.initial_balance
+        self.last_price: float | None = None
+        self.last_signal: SignalResult | None = None
+        self.last_tick_at: datetime | None = None
+        self.last_error: str | None = None
+        self.signal_history: list[dict[str, Any]] = []
+        self._task: asyncio.Task[None] | None = None
+        self._price_task: asyncio.Task[None] | None = None
+        self._news_task: asyncio.Task[None] | None = None
+        self._lock = asyncio.Lock()
+        self.active_symbol: str = self.params.symbol
+        self.last_signal_symbol: str | None = None
+        self.prices: dict[str, float] = {}
+        self._rr_index = 0
+        self._price_rr = 0
+        self._last_buy_at: dict[str, datetime] = {}
+        # Per-symbol ATR exit levels locked at entry (stop / take as fractions).
+        self._exit_levels: dict[str, dict[str, Any]] = {}
+        self.universe = UniverseService(
+            self.market,
+            size=int(self.params.universe_size),
+            min_volume_usd=float(self.params.universe_min_volume_usd),
+            refresh_hours=float(self.params.universe_refresh_hours),
+            core=["BTC-USD", "ETH-USD", "SOL-USD"],
+        )
+        # Last known signal snapshot per universe symbol (for UI table).
+        self._universe_signals: dict[str, dict[str, Any]] = {}
+        self.equity_history = EquityHistory()
+        self._restore_persisted_state()
+
+    def _restore_persisted_state(self) -> None:
+        data = load_state()
+        if not data:
+            return
+        try:
+            wallet_data = data.get("wallet")
+            if isinstance(wallet_data, dict):
+                self.wallet.restore_from_dict(wallet_data)
+            if data.get("peak_equity") is not None:
+                self.peak_equity = float(data["peak_equity"])
+            else:
+                self.peak_equity = max(self.peak_equity, self.wallet.cash)
+            journal_rows = data.get("journal")
+            if isinstance(journal_rows, list):
+                self.journal.load_dicts(journal_rows)
+            history = data.get("signal_history")
+            if isinstance(history, list):
+                self.signal_history = [row for row in history if isinstance(row, dict)][-100:]
+            self._last_buy_at = parse_last_buys(data.get("last_buy_at"))
+            if data.get("killed"):
+                self.killed = True
+                self.kill_reason = str(data.get("kill_reason") or "restored")
+            hist = data.get("equity_history")
+            if isinstance(hist, list):
+                self.equity_history.restore(
+                    hist,
+                    session_started_at=str(data.get("session_started_at") or "") or None,
+                )
+            logger.info(
+                "restored paper state: cash=%.2f positions=%d trades=%d",
+                self.wallet.cash,
+                len(self.wallet.positions),
+                len(self.wallet.trades),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("persist restore failed: %s", exc)
+
+    def _persist_state(self) -> None:
+        payload = {
+            "saved_at": datetime.now(timezone.utc).isoformat(),
+            "peak_equity": self.peak_equity,
+            "killed": self.killed,
+            "kill_reason": self.kill_reason,
+            "wallet": {
+                "initial_balance": self.wallet.initial_balance,
+                "cash": self.wallet.cash,
+                "realized_pnl": self.wallet.realized_pnl,
+                "positions": [
+                    {"symbol": p.symbol, "qty": p.qty, "avg_entry": p.avg_entry}
+                    for p in self.wallet.positions.values()
+                ],
+                "trades": [t.to_dict() for t in self.wallet.trades[-200:]],
+            },
+            "journal": [e.to_dict() for e in self.journal.entries[-200:]],
+            "signal_history": self.signal_history[-50:],
+            "last_buy_at": {k: v.isoformat() for k, v in self._last_buy_at.items()},
+            "session_started_at": self.equity_history.session_started_at.isoformat(),
+            "equity_history": self.equity_history.dump()[-4000:],
+        }
+        save_state(payload)
+
+    def close(self) -> None:
+        try:
+            self._persist_state()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("persist on close: %s", exc)
+        self.market.close()
+
+    async def start(self) -> None:
+        if self.running:
+            return
+        self.running = True
+        self.stream_alive = True
+        try:
+            await asyncio.to_thread(self._ensure_universe, True)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("universe on start: %s", exc)
+        self._task = asyncio.create_task(self._loop())
+        if self._price_task is None or self._price_task.done():
+            self._price_task = asyncio.create_task(self._price_loop())
+        if self._news_task is None or self._news_task.done():
+            self._news_task = asyncio.create_task(self._news_loop())
+
+    async def _news_loop(self) -> None:
+        while self.stream_alive:
+            try:
+                await self._refresh_news_and_publish()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("news loop: %s", exc)
+            await asyncio.sleep(120)
+
+    def _ensure_universe(self, force: bool = False) -> None:
+        if not self.params.universe_enabled:
+            return
+        self.universe.size = int(self.params.universe_size)
+        self.universe.min_volume_usd = float(self.params.universe_min_volume_usd)
+        self.universe.refresh_hours = float(self.params.universe_refresh_hours)
+        symbols = self.universe.refresh(force=force)
+        # Merge news mentions into the book.
+        brief = self.news.cached_brief()
+        if brief is not None:
+            headlines = [h.to_dict() for h in brief.headlines]
+            self.universe.ingest_news(headlines)
+            symbols = list(self.universe.symbols)
+        if symbols:
+            self.params.symbols = symbols
+
+    def _effective_max_open(self, equity: float | None = None) -> int:
+        eq = float(equity if equity is not None else self._equity())
+        dyn = dynamic_max_open(
+            eq,
+            capital_per_slot=float(self.params.capital_per_slot),
+            hard_cap=int(self.params.max_open_hard_cap),
+            floor=5,
+        )
+        return int(min(int(self.params.max_open_symbols), dyn) if self.params.max_open_symbols else dyn)
+
+    def universe_view(self) -> dict[str, Any]:
+        self._ensure_universe(force=False)
+        snap = self.universe.snapshot(self._universe_signals)
+        eq = self._equity()
+        snap["max_open"] = self._effective_max_open(eq)
+        snap["equity"] = eq
+        snap["open_positions"] = list(self.wallet.positions.keys())
+        return snap
+
+    async def stop(self) -> None:
+        self.running = False
+        if self._task:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+            self._task = None
+
+    async def shutdown_streams(self) -> None:
+        self.stream_alive = False
+        if self._price_task:
+            self._price_task.cancel()
+            try:
+                await self._price_task
+            except asyncio.CancelledError:
+                pass
+            self._price_task = None
+        if self._news_task and not self._news_task.done():
+            self._news_task.cancel()
+            try:
+                await self._news_task
+            except asyncio.CancelledError:
+                pass
+            self._news_task = None
+
+    async def _refresh_news_and_publish(self) -> None:
+        try:
+            refreshed = await asyncio.to_thread(self.news.refresh_if_stale)
+            brief = self.news.cached_brief()
+            if brief is not None:
+                headlines = [h.to_dict() for h in brief.headlines]
+                added = self.universe.ingest_news(headlines)
+                if added and self.params.universe_enabled:
+                    self.params.symbols = list(self.universe.symbols)
+            if refreshed or True:
+                await self.publish_live("news")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("news refresh: %s", exc)
+
+    async def _price_loop(self) -> None:
+        while self.stream_alive:
+            try:
+                await asyncio.to_thread(self._refresh_price_only)
+                self._record_equity_sample()
+                await self.publish_live("price")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("price loop: %s", exc)
+            await asyncio.sleep(2)
+
+    def _record_equity_sample(self, *, force: bool = False) -> None:
+        try:
+            eq = self._equity()
+            self.peak_equity = max(self.peak_equity, eq)
+            self.equity_history.maybe_record(
+                equity=eq,
+                cash=float(self.wallet.cash),
+                positions=len(self.wallet.positions),
+                pnl=eq - float(self.wallet.initial_balance),
+                peak_equity=float(self.peak_equity),
+                force=force,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("equity sample skipped: %s", exc)
+
+    def equity_curve(self, range_key: str = "1h") -> dict[str, Any]:
+        # Don't force-sample on every poll — price loop already records.
+        if not self.equity_history.dump():
+            self._record_equity_sample(force=True)
+        else:
+            self._record_equity_sample(force=False)
+        return self.equity_history.query(range_key)
+
+    def _refresh_price_only(self) -> None:
+        # Always mark open positions so portfolio equity moves live.
+        try:
+            open_syms = list(self.wallet.positions.keys())
+        except RuntimeError:
+            open_syms = []
+        for sym in open_syms:
+            self._cache_ticker(sym)
+        book = self.watchlist()
+        if not book:
+            return
+        focus = book[self._price_rr % len(book)]
+        self._price_rr += 1
+        for sym in self._quote_symbols(focus):
+            self._cache_ticker(sym)
+        primary = self.prices.get(self.params.symbol) or self.prices.get(focus)
+        if primary is not None:
+            self.last_price = primary
+
+    def decision_feed(self, limit: int = 12) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for entry in reversed(self.signal_history):
+            text = str(entry.get("narrative") or "")
+            if not text:
+                continue
+            decision = entry.get("decision") or {}
+            signal = entry.get("signal") or {}
+            rows.append(
+                {
+                    "ts": entry.get("ts"),
+                    "symbol": entry.get("symbol"),
+                    "action": decision.get("action") or signal.get("action"),
+                    "reason": decision.get("reason"),
+                    "confidence": signal.get("confidence"),
+                    "order_placed": decision.get("order_placed"),
+                    "narrative": text,
+                }
+            )
+            if len(rows) >= limit:
+                break
+        return rows
+
+    def signal_view(self) -> dict[str, Any]:
+        latest = self.last_signal.to_dict() if self.last_signal else None
+        explanation = self.strategy.explain(self.last_signal) if self.last_signal else None
+        decisions = self.decision_feed()
+        return {
+            "latest": latest,
+            "symbol": self.last_signal_symbol,
+            "active_symbol": self.active_symbol,
+            "explanation": explanation,
+            "narrative": decisions[0]["narrative"] if decisions else None,
+            "decisions": decisions,
+            "history": list(reversed(self.signal_history[-20:])),
+            "last_tick_at": self.last_tick_at.isoformat() if self.last_tick_at else None,
+        }
+
+    def live_payload(self, kind: str = "snapshot") -> dict[str, Any]:
+        account = self.account_state()
+        return {
+            "type": kind,
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "account": account,
+            "price": self.last_price,
+            "signal": self.signal_view(),
+            "decisions": self.decision_feed(),
+            "trades": [t.to_dict() for t in reversed(self.wallet.trades[-30:])],
+            "journal": self.journal.list(limit=40, source="live"),
+            "news": self.news.brief_dict(),
+            "universe": {
+                "symbols": list(self.universe.symbols),
+                "size": len(self.universe.symbols),
+                "news_hits": list(self.universe.news_hits)[:12],
+                "updated_at": self.universe.updated_at.isoformat()
+                if self.universe.updated_at
+                else None,
+            },
+            "status": self.status(),
+        }
+
+    async def publish_live(self, kind: str = "snapshot") -> None:
+        await self.bus.publish(self.live_payload(kind))
+
+    def engage_kill_switch(self, reason: str = "manual") -> dict[str, Any]:
+        first = not self.killed
+        self.killed = True
+        self.kill_reason = reason
+        self.params.auto_trade = False
+        self._flatten_all()
+        if first:
+            self.alerts.notify("Kill switch", f"Trading halted: {reason}", kind="kill")
+        return self.status()
+
+    def resume_from_kill(self) -> dict[str, Any]:
+        self.killed = False
+        self.kill_reason = None
+        return self.status()
+
+    async def _loop(self) -> None:
+        while self.running:
+            try:
+                await self.tick()
+                self.last_error = None
+            except Exception as exc:  # noqa: BLE001
+                self.last_error = str(exc)
+                logger.exception("tick failed")
+                try:
+                    self._persist_state()
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    await self.publish_live("error")
+                except Exception:  # noqa: BLE001
+                    pass
+            await asyncio.sleep(self.params.decision_interval_sec)
+
+    async def tick(self) -> dict[str, Any]:
+        async with self._lock:
+            result = await asyncio.to_thread(self._tick_sync)
+        await self.publish_live("decision")
+        return result
+
+    def _apply_slippage(self, side: str, price: float) -> float:
+        slip = self.params.slippage_bps / 10_000.0
+        if side == "buy":
+            return price * (1.0 + slip)
+        return price * (1.0 - slip)
+
+    def _check_auto_kill(self, equity: float) -> None:
+        if not self.params.kill_switch_enabled or self.killed:
+            return
+        self.peak_equity = max(self.peak_equity, equity)
+        total_pnl_pct = ((equity - self.wallet.initial_balance) / self.wallet.initial_balance) * 100
+        dd_pct = 0.0
+        if self.peak_equity > 0:
+            dd_pct = ((self.peak_equity - equity) / self.peak_equity) * 100
+        if total_pnl_pct <= -self.params.max_daily_loss_pct:
+            self.engage_kill_switch(f"max_loss_{total_pnl_pct:.2f}%")
+        elif dd_pct >= self.params.max_drawdown_pct:
+            self.engage_kill_switch(f"max_drawdown_{dd_pct:.2f}%")
+
+    def _risk_score(self, equity: float) -> float:
+        """0 = calm (blue), 1 = critical (red)."""
+        pnl_pct = abs((equity - self.wallet.initial_balance) / self.wallet.initial_balance)
+        dd = 0.0
+        if self.peak_equity > 0:
+            dd = (self.peak_equity - equity) / self.peak_equity
+        raw = max(pnl_pct * 4 if equity < self.wallet.initial_balance else 0.0, dd * 3)
+        if self.killed:
+            raw = max(raw, 0.9)
+        return float(min(1.0, raw))
+
+    def watchlist(self) -> list[str]:
+        symbols = [str(s).strip().upper() for s in self.params.symbols if str(s).strip()]
+        deduped = list(dict.fromkeys(symbols))
+        if deduped:
+            return deduped
+        return [self.params.symbol]
+
+    def _next_symbol(self) -> str:
+        book = self.watchlist()
+        symbol = book[self._rr_index % len(book)]
+        self._rr_index += 1
+        self.active_symbol = symbol
+        return symbol
+
+    def _quote_symbols(self, focus: str) -> list[str]:
+        book = self.watchlist()
+        try:
+            open_syms = list(self.wallet.positions.keys())
+        except RuntimeError:
+            open_syms = []
+        if len(book) <= 4:
+            raw = [*book, *open_syms, focus, self.params.symbol]
+        else:
+            raw = [focus, self.params.symbol, *open_syms]
+        seen: list[str] = []
+        for sym in raw:
+            if sym and sym not in seen:
+                seen.append(sym)
+        return seen
+
+    def _cache_ticker(self, symbol: str) -> float | None:
+        try:
+            ticker = self.market.get_ticker(symbol)
+            price = float(ticker["price"])
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("ticker %s: %s", symbol, exc)
+            return self.prices.get(symbol)
+        self.prices[symbol] = price
+        return price
+
+    def _equity(self) -> float:
+        return float(self.wallet.equity(self.prices_map()))
+
+    def _sell_qty(self, symbol: str, qty: float, price: float, note: str) -> Trade | None:
+        pos = self.wallet.get_position(symbol)
+        if pos is None or qty <= 0 or price <= 0:
+            return None
+        qty = min(qty, pos.qty)
+        if pos.qty - qty < 1e-8:
+            qty = pos.qty
+        fill = self._apply_slippage("sell", price)
+        try:
+            trade = self.wallet.sell(
+                symbol, qty=qty, price=fill, fee_bps=self.params.fee_bps, note=note
+            )
+        except ValueError:
+            logger.warning("sell failed %s", symbol)
+            return None
+        if self.wallet.get_position(symbol) is None:
+            self._exit_levels.pop(symbol, None)
+        return trade
+
+    def _levels_for(self, symbol: str) -> tuple[float, float]:
+        stored = self._exit_levels.get(symbol)
+        if stored:
+            return float(stored["take_pct"]), float(stored["stop_pct"])
+        return float(self.params.take_profit_pct), float(self.params.stop_loss_pct)
+
+    def _decision_narrative(
+        self,
+        *,
+        symbol: str,
+        signal: SignalResult | None,
+        plan: OrderPlan,
+        order_placed: bool,
+        price: float,
+    ) -> str:
+        detail = signal.detail if signal is not None else ""
+        buy_th, sell_th = thresholds_from_detail(
+            detail, self.params.buy_threshold, self.params.sell_threshold
+        )
+        features = signal.features if signal is not None else {}
+        confidence = signal.confidence if signal is not None else 0.0
+        signal_action = signal.action if signal is not None else plan.side
+        return decision_narrative(
+            symbol=symbol,
+            signal_action=signal_action,
+            confidence=confidence,
+            features=features,
+            plan_side=plan.side,
+            plan_reason=plan.reason,
+            order_placed=order_placed,
+            buy_threshold=buy_th,
+            sell_threshold=sell_th,
+            base_buy_threshold=self.params.buy_threshold,
+            base_sell_threshold=self.params.sell_threshold,
+            rsi_oversold=self.params.rsi_oversold,
+            rsi_overbought=self.params.rsi_overbought,
+            auto_trade=self.params.auto_trade,
+            killed=self.killed or plan.reason == "kill",
+            price=price,
+        )
+
+    def _journal_fill(self, trade: Trade, signal: SignalResult | None, note: str) -> None:
+        if signal is not None:
+            explanation = self.strategy.explain(signal)
+            features = signal.features
+            top = self.strategy.top_features(features, n=5)
+            confidence = signal.confidence
+        else:
+            features = {}
+            top = []
+            confidence = 1.0
+            explanation = {
+                "exit:tp": "Take-profit hit",
+                "exit:sl": "Stop-loss hit",
+                "exit:kill": "Kill switch flatten",
+            }.get(note, "Forced exit")
+        if note and note not in explanation:
+            explanation = f"{explanation} | {note}"
+        narrative = self._decision_narrative(
+            symbol=trade.symbol,
+            signal=signal,
+            plan=_plan_from_note(trade.side, note),
+            order_placed=True,
+            price=trade.price,
+        )
+        self.journal.add(
+            symbol=trade.symbol,
+            action=trade.side,
+            price=trade.price,
+            qty=trade.qty,
+            trade_id=trade.id,
+            confidence=confidence,
+            features=features,
+            top_features=top,
+            explanation=explanation,
+            simulated=True,
+            source="live",
+            note=note,
+            narrative=narrative,
+        )
+        self.alerts.on_trade(trade.symbol, trade.side, trade.qty, trade.price)
+
+    def _flatten_all(self) -> list[dict[str, Any]]:
+        closed: list[dict[str, Any]] = []
+        for sym in list(self.wallet.positions.keys()):
+            pos = self.wallet.get_position(sym)
+            if pos is None:
+                continue
+            price = self.prices.get(sym)
+            if price is None:
+                price = self._cache_ticker(sym)
+            if price is None:
+                price = pos.avg_entry
+            trade = self._sell_qty(sym, pos.qty, price, "exit:kill")
+            if trade is None:
+                continue
+            self._journal_fill(trade, None, "exit:kill")
+            closed.append(
+                {"symbol": sym, "trade_id": trade.id, "reason": "kill", "note": "exit:kill"}
+            )
+        return closed
+
+    def _protect_positions(self) -> list[dict[str, Any]]:
+        """Full exit on take-profit or stop-loss, even when the model says hold."""
+        exits: list[dict[str, Any]] = []
+        for sym in list(self.wallet.positions.keys()):
+            pos = self.wallet.get_position(sym)
+            if pos is None:
+                continue
+            price = self.prices.get(sym)
+            if price is None:
+                price = self._cache_ticker(sym)
+            if price is None:
+                continue
+            take_pct, stop_pct = self._levels_for(sym)
+            plan = plan_protective(price, pos.avg_entry, take_pct, stop_pct)
+            if plan is None:
+                continue
+            trade = self._sell_qty(sym, pos.qty * plan.sell_fraction, price, plan.note)
+            if trade is None:
+                continue
+            self._journal_fill(trade, None, plan.note)
+            exits.append(
+                {
+                    "symbol": sym,
+                    "trade_id": trade.id,
+                    "reason": plan.reason,
+                    "note": plan.note,
+                    "price": trade.price,
+                    "qty": trade.qty,
+                }
+            )
+        return exits
+
+    def _execute_signal(
+        self,
+        symbol: str,
+        signal: SignalResult,
+        price: float,
+        candles: Any | None = None,
+    ) -> tuple[Trade | None, OrderPlan]:
+        now = datetime.now(timezone.utc)
+        pos = self.wallet.get_position(symbol)
+        equity = self._equity()
+        pos_val = pos.market_value(price) if pos else 0.0
+        plan = plan_signal(
+            signal.action,
+            signal.confidence,
+            has_position=pos is not None,
+            position_value=pos_val,
+            equity=equity,
+            max_position_pct=self.params.max_position_pct,
+            position_size_pct=self.params.position_size_pct,
+            open_symbols=len(self.wallet.positions),
+            max_open_symbols=self._effective_max_open(equity),
+            cooldown_active=(
+                cooldown_active(self._last_buy_at.get(symbol), now, self.params.add_cooldown_min)
+                if pos is not None
+                else False
+            ),
+            aggressive_sell_confidence=self.params.aggressive_sell_confidence,
+            sell_threshold=self.params.sell_threshold,
+        )
+        if plan.side == "hold":
+            return None, plan
+
+        if plan.side == "buy":
+            if not self._symbol_tradeable(symbol, price):
+                return None, OrderPlan("hold", 0.0, "budget", "hold:illiquid")
+            open_r = portfolio_open_risk_r(
+                self.wallet.positions,
+                self.prices_map(),
+                self._exit_levels,
+                equity,
+                float(self.params.stop_loss_pct),
+            )
+            if open_r >= float(self.params.max_portfolio_risk_r):
+                return None, OrderPlan("hold", 0.0, "portfolio_risk", "hold:portfolio_risk")
+            levels = compute_exit_levels(
+                price,
+                candles,
+                fee_bps=self.params.fee_bps,
+                slippage_bps=self.params.slippage_bps,
+                stop_atr_mult=float(self.params.atr_stop_mult),
+                reward_risk=float(self.params.reward_risk),
+                floor_stop_pct=max(0.008, float(self.params.stop_loss_pct) * 0.5),
+                cap_stop_pct=0.04,
+            )
+            fill = self._apply_slippage("buy", price)
+            risk_spend = risk_position_spend(
+                equity,
+                self.wallet.cash,
+                fill,
+                levels.stop_pct,
+                risk_frac=float(self.params.risk_per_trade_pct),
+                max_position_pct=float(self.params.max_position_pct),
+            )
+            soft_cap = buy_spend(
+                self.wallet.cash,
+                equity,
+                pos_val,
+                max(self.params.position_size_pct, 0.15),
+                self.params.max_position_pct,
+            )
+            spend = min(risk_spend, soft_cap) if soft_cap > 0 else risk_spend
+            # Room left under the per-symbol equity cap.
+            room = max(0.0, self.params.max_position_pct * equity - pos_val)
+            spend = min(spend, room, self.wallet.cash)
+            fee_mult = 1.0 + self.params.fee_bps / 10_000.0
+            if spend < 15 or fill <= 0:
+                return None, OrderPlan("hold", 0.0, "budget", "hold:budget")
+            qty = spend / (fill * fee_mult)
+            try:
+                trade = self.wallet.buy(
+                    symbol, qty=qty, price=fill, fee_bps=self.params.fee_bps, note=plan.note
+                )
+            except ValueError:
+                return None, OrderPlan("hold", 0.0, "budget", "hold:budget")
+            self._last_buy_at[symbol] = now
+            self._exit_levels[symbol] = annotate_levels(levels)
+            logger.info(
+                "entry %s stop=%.2f%% take=%.2f%% atr_pct=%s spend=%.2f",
+                symbol,
+                levels.stop_pct * 100,
+                levels.take_pct * 100,
+                f"{levels.atr_pct * 100:.2f}%" if levels.atr_pct else "n/a",
+                spend,
+            )
+            return trade, plan
+
+        if pos is None:
+            return None, OrderPlan("hold", 0.0, "flat", "hold:flat")
+
+        # Discretionary signal exits: never dump at a net loss — SL/TP own that.
+        last_buy = self._last_buy_at.get(symbol)
+        min_hold = int(self.params.min_hold_min)
+        if min_hold > 0 and last_buy is not None:
+            if (now - last_buy).total_seconds() < min_hold * 60:
+                return None, OrderPlan("hold", 0.0, "min_hold", "hold:min_hold")
+        if not sell_is_net_positive(
+            pos.avg_entry,
+            price,
+            fee_bps=self.params.fee_bps,
+            slippage_bps=self.params.slippage_bps,
+        ):
+            return None, OrderPlan("hold", 0.0, "fee_guard", "hold:fee_guard")
+        plan = OrderPlan("sell", 1.0, "signal", "exit:signal")
+        trade = self._sell_qty(symbol, pos.qty, price, plan.note)
+        if trade is None:
+            return None, OrderPlan("hold", 0.0, "flat", "hold:flat")
+        return trade, plan
+
+    def _tick_sync(self) -> dict[str, Any]:
+        self._ensure_universe(force=False)
+        symbol = self._next_symbol()
+        for sym in self._quote_symbols(symbol):
+            self._cache_ticker(sym)
+        primary = self.prices.get(self.params.symbol)
+        if primary is not None:
+            self.last_price = primary
+
+        if self.killed and self.wallet.positions:
+            self._flatten_all()
+        else:
+            self._check_auto_kill(self._equity())
+
+        exits: list[dict[str, Any]] = []
+        if self.params.auto_trade and not self.killed:
+            exits = self._protect_positions()
+
+        price = self.prices.get(symbol)
+        if price is None:
+            raise RuntimeError(f"no price for {symbol}")
+
+        candles = self.market.get_candles(
+            symbol,
+            granularity=self.params.candle_granularity_sec,
+            limit=self.params.candle_lookback,
+        )
+        try:
+            train_info = self.strategy.train(candles, self.params)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("train failed (%s); falling back to heuristic", exc)
+            train_info = {"ok": False, "reason": f"train_exception:{exc}"}
+            self.strategy.model = None
+        try:
+            self.news.refresh_if_stale()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("news refresh: %s", exc)
+        signal = self.strategy.predict(candles, self.params, news=self.news.cached_brief())
+        # Universe scan entries: open small risk-sized buys when flat so the book
+        # is not stuck on sell-only signals with nothing to sell.
+        signal = self._scan_entry_bias(signal, symbol)
+        self.last_signal = signal
+        self.last_signal_symbol = symbol
+        self.last_tick_at = datetime.now(timezone.utc)
+        self.last_error = None
+        self._universe_signals[symbol] = {
+            "action": signal.action,
+            "confidence": float(signal.confidence),
+            "ts": self.last_tick_at.isoformat(),
+            "from_news": any(h.get("symbol") == symbol for h in self.universe.news_hits),
+        }
+
+        if not self.killed:
+            self.alerts.on_strong_signal(symbol, signal.action, signal.confidence)
+
+        protected = next((item for item in exits if item["symbol"] == symbol), None)
+        trade: Trade | None = None
+        if protected is not None:
+            plan = OrderPlan("sell", 1.0, str(protected["reason"]), str(protected["note"]))
+        elif self.killed or not self.params.auto_trade:
+            plan = OrderPlan("hold", 0.0, "kill" if self.killed else "hold", "")
+        else:
+            trade, plan = self._execute_signal(symbol, signal, price, candles=candles)
+            if trade is not None:
+                self._journal_fill(trade, signal, trade.note or plan.note)
+
+        self._check_auto_kill(self._equity())
+        state = self.account_state()
+        self.alerts.on_pnl(float(state["total_pnl"]))
+
+        explanation = self.strategy.explain(signal)
+        if plan.note and plan.note not in explanation:
+            explanation = f"{explanation} | {plan.note}"
+        trade_id = trade.id if trade else (protected["trade_id"] if protected else None)
+        order_placed = trade is not None or protected is not None
+        buy_th, sell_th = thresholds_from_detail(
+            signal.detail, self.params.buy_threshold, self.params.sell_threshold
+        )
+        narrative = self._decision_narrative(
+            symbol=symbol,
+            signal=signal,
+            plan=plan,
+            order_placed=order_placed,
+            price=price,
+        )
+        extra_exits = format_other_exits(exits, symbol)
+        if extra_exits:
+            narrative = f"{narrative} {extra_exits}"
+        entry = {
+            "ts": self.last_tick_at.isoformat(),
+            "symbol": symbol,
+            "price": price,
+            "signal": signal.to_dict(),
+            "decision": {
+                "action": plan.side,
+                "reason": plan.reason,
+                "note": plan.note,
+                "sell_fraction": plan.sell_fraction,
+                "order_placed": order_placed,
+                "buy_threshold": buy_th,
+                "sell_threshold": sell_th,
+            },
+            "exits": exits,
+            "train": train_info,
+            "trade_id": trade_id,
+            "explanation": explanation,
+            "narrative": narrative,
+            "killed": self.killed,
+        }
+        self.signal_history.append(entry)
+        self.signal_history = self.signal_history[-100:]
+        self._persist_state()
+        return entry
+
+    def _symbol_tradeable(self, symbol: str, price: float) -> bool:
+        """Prefer liquid majors / top volume; reject broken or dust prices."""
+        if price <= 0 or price < 1e-8:
+            return False
+        core = {"BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD", "LINK-USD", "AVAX-USD", "DOGE-USD", "ADA-USD"}
+        if symbol in core:
+            return True
+        if any(h.get("symbol") == symbol for h in self.universe.news_hits):
+            return True
+        row = next((r for r in self.universe.rows if r.symbol == symbol), None)
+        if row is None:
+            return False
+        # Top half of the volume book only — skip illiquid meme tails.
+        return int(row.rank) <= max(15, int(self.params.universe_size) // 3) and float(
+            row.volume_24h or 0
+        ) >= float(self.params.universe_min_volume_usd)
+
+    def _scan_entry_bias(self, signal: SignalResult, symbol: str) -> SignalResult:
+        """Style-aware scan entries (prudent / intermediaire / agressif)."""
+        if self.wallet.get_position(symbol) is not None:
+            return signal
+        if signal.action == "buy":
+            return signal
+        style = normalize_style(self.params.trading_style)
+        g = scan_gates(style)
+        buy_p = float(signal.probs.get("buy", 0.0) or 0.0)
+        sell_p = float(signal.probs.get("sell", 0.0) or 0.0)
+        rsi = float(signal.features.get("rsi", 50.0) or 50.0)
+        macd_hist = float(signal.features.get("macd_hist", 0.0) or 0.0)
+        news_hit = next(
+            (h for h in self.universe.news_hits if h.get("symbol") == symbol),
+            None,
+        )
+        if rsi >= float(self.params.rsi_overbought) and sell_p >= 0.55:
+            return signal
+
+        reason = ""
+        conf = float(signal.confidence)
+        if (
+            rsi <= float(self.params.rsi_oversold) + g["rsi_extra"]
+            and sell_p < g["sell_cap"]
+            and buy_p >= g["min_buy_p_rsi"]
+        ):
+            reason = "entry:rsi_scan"
+            conf = max(buy_p, float(self.params.buy_threshold))
+        elif buy_p >= g["min_buy_p_edge"] and buy_p >= sell_p + g["edge_gap"]:
+            reason = "entry:prob_scan"
+            conf = buy_p
+        elif (
+            g["allow_weak_prob"] >= 1.0
+            and buy_p >= 0.22
+            and buy_p + 0.02 >= sell_p * 0.4
+            and sell_p < 0.8
+        ):
+            reason = "entry:prob_scan"
+            conf = max(buy_p, 0.4)
+        elif (
+            g["allow_macd"] >= 1.0
+            and macd_hist > 0
+            and g["macd_rsi_lo"] <= rsi <= g["macd_rsi_hi"]
+            and buy_p >= sell_p
+            and buy_p >= g["min_buy_p_macd"]
+        ):
+            reason = "entry:macd_scan"
+            conf = max(buy_p, 0.48)
+        elif (
+            news_hit is not None
+            and float(news_hit.get("score") or 0) >= g["news_score"]
+            and rsi < g["news_rsi_cap"]
+            and sell_p < g["sell_cap"]
+        ):
+            reason = "entry:news_scan"
+            conf = max(buy_p, float(self.params.buy_threshold) * 0.95)
+        if not reason:
+            return signal
+        return SignalResult(
+            action="buy",
+            confidence=float(conf),
+            probs=dict(signal.probs),
+            features=dict(signal.features),
+            model_ready=signal.model_ready,
+            detail=f"{signal.detail} | {reason}|style={style}",
+        )
+
+    def update_params(self, patch: dict[str, Any]) -> BotParams:
+        data = self.params.model_dump()
+        clean = {k: v for k, v in patch.items() if v is not None}
+        explicit_book = "symbols" in clean or "watchlist" in clean
+        if "symbols" not in clean and "watchlist" in clean:
+            clean["symbols"] = clean["watchlist"]
+        clean.pop("watchlist", None)
+        if "symbol" in clean and not explicit_book:
+            sym = str(clean["symbol"]).strip().upper()
+            current = [str(s).strip().upper() for s in data.get("symbols") or []]
+            if sym and sym not in current:
+                clean["symbols"] = [sym, *current]
+        style_requested = "trading_style" in clean
+        if style_requested:
+            style = normalize_style(clean.get("trading_style"))
+            data = apply_style_preset(data, style)
+            clean.pop("trading_style", None)
+        allowed = set(BotParams.model_fields)
+        data.update({k: v for k, v in clean.items() if k in allowed})
+        if style_requested:
+            data["trading_style"] = normalize_style(data.get("trading_style"))
+        new_params = BotParams(**data)
+        balance_changed = new_params.initial_balance != self.params.initial_balance
+        self.params = new_params
+        if self.params.universe_enabled:
+            self.universe.size = int(self.params.universe_size)
+            self.universe.min_volume_usd = float(self.params.universe_min_volume_usd)
+        if balance_changed and not self.wallet.trades and not self.wallet.positions:
+            self.wallet.reset(new_params.initial_balance)
+            self.peak_equity = new_params.initial_balance
+            self._last_buy_at.clear()
+        return self.params
+
+    def update_alerts(self, patch: dict[str, Any]) -> AlertParams:
+        return self.alerts.update_params(patch)
+
+    def reset_account(self, initial_balance: float | None = None) -> dict[str, Any]:
+        bal = initial_balance if initial_balance is not None else self.params.initial_balance
+        self.params.initial_balance = bal
+        self.wallet.reset(bal)
+        self.peak_equity = bal
+        self.signal_history.clear()
+        self.last_signal = None
+        self.last_signal_symbol = None
+        self.active_symbol = self.params.symbol
+        self._rr_index = 0
+        self._last_buy_at.clear()
+        self._exit_levels.clear()
+        self.journal.clear()
+        self.alerts.reset_pnl_tracker()
+        self.killed = False
+        self.kill_reason = None
+        self.equity_history.reset_session()
+        self.equity_history.maybe_record(
+            equity=bal,
+            cash=bal,
+            positions=0,
+            pnl=0.0,
+            peak_equity=bal,
+            force=True,
+        )
+        clear_state()
+        self._persist_state()
+        return self.account_state()
+
+    def prices_map(self) -> dict[str, float]:
+        prices = dict(self.prices)
+        if self.params.symbol not in prices:
+            if self.last_price is not None:
+                prices[self.params.symbol] = self.last_price
+            else:
+                px = self._cache_ticker(self.params.symbol)
+                if px is not None:
+                    prices[self.params.symbol] = px
+        for sym, pos in self.wallet.positions.items():
+            prices.setdefault(sym, pos.avg_entry)
+        return prices
+
+    def status(self) -> dict[str, Any]:
+        return {
+            "bot_running": self.running,
+            "killed": self.killed,
+            "kill_reason": self.kill_reason,
+            "auto_trade": self.params.auto_trade,
+            "symbol": self.params.symbol,
+            "active_symbol": self.active_symbol,
+            "symbols": self.watchlist(),
+        }
+
+    def system_status(self) -> dict[str, Any]:
+        """Human-facing feature board for the dashboard."""
+        now = datetime.now(timezone.utc)
+        features: list[dict[str, Any]] = []
+
+        def add(fid: str, label: str, state: str, detail: str) -> None:
+            features.append({"id": fid, "label": label, "state": state, "detail": detail})
+
+        add("engine", "Moteur", "ok", "API paper en ligne (mode simulation)")
+
+        if self.killed:
+            add(
+                "kill",
+                "Arrêt d’urgence",
+                "error",
+                f"Actif — {self.kill_reason or 'raison inconnue'}. Aucun nouvel ordre.",
+            )
+        else:
+            add("kill", "Arrêt d’urgence", "ok", "Inactif — trading autorisé côté sécurité")
+
+        if self.running:
+            add("bot_loop", "Boucle bot", "ok", f"Tourne toutes les {self.params.decision_interval_sec}s")
+        else:
+            add("bot_loop", "Boucle bot", "off", "Arrêtée — cliquez Démarrer")
+
+        if self.params.auto_trade and not self.killed:
+            add("auto_trade", "Trading automatique", "ok", "Les ordres paper peuvent être placés")
+        elif self.killed:
+            add("auto_trade", "Trading automatique", "error", "Bloqué par l’arrêt d’urgence")
+        else:
+            add(
+                "auto_trade",
+                "Trading automatique",
+                "warn",
+                "OFF — analyse possible, mais aucun ordre",
+            )
+
+        tp = float(self.params.take_profit_pct) * 100
+        sl = float(self.params.stop_loss_pct) * 100
+        add(
+            "tp_sl",
+            "TP / SL micro",
+            "ok",
+            f"Prise de gain {tp:.2f}% · stop-loss {sl:.2f}% · cooldown {self.params.add_cooldown_min} min",
+        )
+
+        book = self.watchlist()
+        add(
+            "watchlist",
+            "Multi-paires",
+            "ok" if len(book) > 1 else "warn",
+            f"{', '.join(book)} · actif {self.active_symbol}",
+        )
+
+        try:
+            brief = self.news.cached_brief()
+            headlines = getattr(brief, "headlines", ()) or ()
+            n = len(headlines)
+            bias = float(getattr(brief, "overall_bias", getattr(brief, "overall_score", 0.0)) or 0.0)
+            add(
+                "news",
+                "Actualités",
+                "ok" if n > 0 else "warn",
+                f"{n} titres en cache · biais {bias:+.2f}",
+            )
+        except Exception as exc:  # noqa: BLE001
+            add("news", "Actualités", "warn", f"Lecture news: {exc}")
+
+        if STATE_PATH.exists():
+            add(
+                "persist",
+                "Sauvegarde paper",
+                "ok",
+                f"État disque présent ({STATE_PATH.name}) — survit à un redémarrage",
+            )
+        else:
+            add(
+                "persist",
+                "Sauvegarde paper",
+                "warn",
+                "Pas encore de fichier d’état — sera créé au prochain tick",
+            )
+
+        if self.last_tick_at is None:
+            add("last_tick", "Dernière décision", "warn", "Aucun tick encore")
+        else:
+            age = max(0.0, (now - self.last_tick_at).total_seconds())
+            limit = max(90.0, float(self.params.decision_interval_sec) * 3)
+            if self.last_error:
+                add(
+                    "last_tick",
+                    "Dernière décision",
+                    "error",
+                    f"Il y a {int(age)}s — erreur: {self.last_error}",
+                )
+            elif age > limit and self.running:
+                add(
+                    "last_tick",
+                    "Dernière décision",
+                    "warn",
+                    f"Il y a {int(age)}s — boucle peut-être lente",
+                )
+            else:
+                add(
+                    "last_tick",
+                    "Dernière décision",
+                    "ok",
+                    f"Il y a {int(age)}s · {self.last_signal_symbol or self.params.symbol}",
+                )
+
+        open_n = len(self.wallet.positions)
+        add(
+            "positions",
+            "Positions ouvertes",
+            "ok" if open_n > 0 else "off",
+            f"{open_n} position(s) · cash {self.wallet.cash:,.2f} $",
+        )
+
+        ranks = {"ok": 0, "off": 1, "warn": 2, "error": 3}
+        overall = "ok"
+        for f in features:
+            if ranks.get(str(f["state"]), 0) > ranks[overall]:
+                overall = str(f["state"])
+
+        return {
+            "overall": overall,
+            "checked_at": now.isoformat(),
+            "features": features,
+            **self.status(),
+        }
+
+    def account_state(self) -> dict[str, Any]:
+        prices = self.prices_map()
+        snap = self.wallet.snapshot(prices)
+        equity = float(snap["equity"])
+        self.peak_equity = max(self.peak_equity, equity)
+        dd = 0.0
+        if self.peak_equity > 0:
+            dd = ((self.peak_equity - equity) / self.peak_equity) * 100
+        return {
+            **snap,
+            "symbol": self.params.symbol,
+            "symbols": self.watchlist(),
+            "active_symbol": self.active_symbol,
+            "prices": prices,
+            "last_price": self.last_price,
+            "bot_running": self.running,
+            "auto_trade": self.params.auto_trade,
+            "killed": self.killed,
+            "kill_reason": self.kill_reason,
+            "peak_equity": self.peak_equity,
+            "drawdown_pct": dd,
+            "risk_score": self._risk_score(equity),
+            "last_tick_at": self.last_tick_at.isoformat() if self.last_tick_at else None,
+            "last_error": self.last_error,
+            "max_open_symbols": self._effective_max_open(equity),
+            "open_count": len(self.wallet.positions),
+            "universe_size": len(self.watchlist()),
+        }
