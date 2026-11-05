@@ -45,7 +45,6 @@ const RANGE_OPTIONS: Array<{ id: PaperTimeRange; label: string; hint: string }> 
   { id: "1h", label: "1h", hint: "Dernière heure" },
   { id: "6h", label: "6h", hint: "6 dernières heures" },
   { id: "24h", label: "24h", hint: "24 dernières heures" },
-  { id: "1d", label: "1j", hint: "Dernier jour" },
   { id: "1w", label: "1 sem.", hint: "7 derniers jours" },
   { id: "1mo", label: "1 mois", hint: "30 derniers jours" },
   { id: "1y", label: "1 an", hint: "365 derniers jours" },
@@ -85,6 +84,8 @@ const DEFAULT_LAYERS: Record<SeriesKey, boolean> = {
 function loadRange(): PaperTimeRange {
   if (typeof window === "undefined") return "1h";
   const raw = window.localStorage.getItem(STORAGE_KEY);
+  // Legacy alias: 1j was duplicate of 24h.
+  if (raw === "1d") return "24h";
   if (raw && VALID_RANGES.has(raw as PaperTimeRange)) return raw as PaperTimeRange;
   return "1h";
 }
@@ -118,44 +119,32 @@ function rangeCutoffMs(range: PaperTimeRange, sessionStartedAt: number | null): 
   return null;
 }
 
-/** Fit the X domain to data when the selected window is mostly empty. */
+/** X domain always follows the selected time scale (so range buttons actually work). */
 function visibleDomainMs(
   range: PaperTimeRange,
   sessionStartedAt: number | null,
   series: PaperSample[],
-): { start: number; end: number; fitted: boolean } {
+): { start: number; end: number; sparse: boolean } {
   const end = Date.now();
   const delta = rangeDeltaMs(range);
-  let windowStart: number;
-  if (delta != null) windowStart = end - delta;
-  else if (range === "session") {
-    windowStart = sessionStartedAt ?? series[0]?.t ?? end - 3600_000;
+  let start: number;
+  if (delta != null) {
+    start = end - delta;
+  } else if (range === "session") {
+    start = sessionStartedAt ?? series[0]?.t ?? end - 3600_000;
+    start = Math.min(start, end - 60_000);
   } else if (series.length) {
-    windowStart = series[0].t;
+    start = series[0].t;
+    if (end - start < 60_000) start = end - 60_000;
   } else {
-    windowStart = end - 3600_000;
+    start = end - 3600_000;
   }
 
-  if (series.length === 0) {
-    return { start: windowStart, end, fitted: false };
-  }
-
-  const dataStart = series[0].t;
-  const dataEnd = Math.max(series[series.length - 1].t, end);
-  const dataSpan = Math.max(1, dataEnd - dataStart);
-  const windowSpan = Math.max(60_000, end - windowStart);
-
-  // Short history: zoom on the real samples so the curve fills the plot.
-  if (dataSpan < windowSpan * 0.4 || series.length < 8) {
-    const pad = Math.max(dataSpan * 0.12, 90_000);
-    return {
-      start: dataStart - pad,
-      end: Math.max(dataEnd + pad * 0.35, dataStart + pad * 2),
-      fitted: true,
-    };
-  }
-
-  return { start: windowStart, end, fitted: false };
+  const inWindow = series.filter((s) => s.t >= start && s.t <= end);
+  const dataSpan =
+    inWindow.length >= 2 ? inWindow[inWindow.length - 1].t - inWindow[0].t : 0;
+  const sparse = inWindow.length < 2 || dataSpan < (end - start) * 0.25;
+  return { start, end, sparse };
 }
 
 function formatAxisTime(t: number, spanMs: number): string {
@@ -301,14 +290,18 @@ export function PaperSessionChart({
   );
 
   const applyHistory = useCallback(
-    async (nextRange: PaperTimeRange) => {
+    async (nextRange: PaperTimeRange, opts?: { replace?: boolean }) => {
       setLoadingHistory(true);
       setHistoryError(null);
       try {
         const res = await api.equityHistory(nextRange);
+        let sessionTs: number | null = null;
         if (res.session_started_at) {
           const ts = Date.parse(res.session_started_at);
-          if (!Number.isNaN(ts)) setSessionStartedAt(ts);
+          if (!Number.isNaN(ts)) {
+            sessionTs = ts;
+            setSessionStartedAt(ts);
+          }
         }
         const mapped: PaperSample[] = (res.points || []).map((p) => ({
           t: Date.parse(p.t) || Date.now(),
@@ -318,16 +311,20 @@ export function PaperSessionChart({
           pnl: Number(p.pnl) || 0,
           drawdownPct: Number(p.drawdown_pct) || 0,
         }));
+        const cutoff = rangeCutoffMs(nextRange, sessionTs ?? sessionStartedAt);
         setSeries((prev) => {
-          // Union by ~2s buckets so a sparse API refresh never wipes dense live samples.
           const byBucket = new Map<number, PaperSample>();
           const put = (p: PaperSample) => {
+            if (cutoff != null && p.t < cutoff) return;
             const key = Math.round(p.t / 2000);
             const existing = byBucket.get(key);
             if (!existing || p.t >= existing.t) byBucket.set(key, p);
           };
           for (const p of mapped) put(p);
-          for (const p of prev) put(p);
+          // Keep dense live samples inside the new window; drop out-of-range points.
+          if (!opts?.replace) {
+            for (const p of prev) put(p);
+          }
           const next = [...byBucket.values()].sort((a, b) => a.t - b.t);
           const trimmed = next.length > maxPoints ? next.slice(-maxPoints) : next;
           peakInView.current = trimmed.reduce(
@@ -343,23 +340,27 @@ export function PaperSessionChart({
         setLoadingHistory(false);
       }
     },
-    [maxPoints],
+    [maxPoints, sessionStartedAt],
   );
 
   useEffect(() => {
-    void applyHistory(range);
-  }, [range, applyHistory]);
+    void applyHistory(range, { replace: true });
+  }, [range]); // eslint-disable-line react-hooks/exhaustive-deps -- only on range change
 
   useEffect(() => {
     const timer = window.setInterval(() => {
-      void applyHistory(rangeRef.current);
+      void applyHistory(rangeRef.current, { replace: false });
     }, 20_000);
     return () => window.clearInterval(timer);
   }, [applyHistory]);
 
   function changeRange(next: PaperTimeRange) {
-    setRange(next);
+    if (next === range) return;
     setHoverIdx(null);
+    setSeries([]);
+    lastSample.current = null;
+    peakInView.current = null;
+    setRange(next);
     try {
       window.localStorage.setItem(STORAGE_KEY, next);
     } catch {
@@ -400,11 +401,12 @@ export function PaperSessionChart({
     const span = Math.max(60_000, domain.end - domain.start);
     const innerW = W - PAD.left - PAD.right;
     const innerH = H - PAD.top - PAD.bottom;
+    const plotSeries = series.filter((s) => s.t >= domain.start - 1000 && s.t <= domain.end + 1000);
 
     // Left axis = portfolio dollars only (equity + optional cash). Never mix with ~0 P&L.
     const moneyVals: number[] = [];
-    if (series.length) {
-      for (const s of series) {
+    if (plotSeries.length) {
+      for (const s of plotSeries) {
         moneyVals.push(s.equity);
         if (layers.cash) moneyVals.push(s.cash);
       }
@@ -424,16 +426,16 @@ export function PaperSessionChart({
       maxM += pad;
     }
 
-    const maxPos = Math.max(1, ...series.map((s) => s.positions), positions, 1);
+    const maxPos = Math.max(1, ...plotSeries.map((s) => s.positions), positions, 1);
     const maxDd = Math.max(
       0.5,
-      ...series.map((s) => s.drawdownPct),
+      ...plotSeries.map((s) => s.drawdownPct),
       drawdownPct,
       0.5,
     );
 
     // Optional P&L band uses its own normalized overlay near the bottom third when enabled.
-    const pnlVals = series.length ? series.map((s) => s.pnl) : [pnl];
+    const pnlVals = plotSeries.length ? plotSeries.map((s) => s.pnl) : [pnl];
     let minPnl = Math.min(0, ...pnlVals);
     let maxPnl = Math.max(0, ...pnlVals);
     if (maxPnl - minPnl < 1) {
@@ -454,11 +456,11 @@ export function PaperSessionChart({
       return top + ((maxPnl - v) / (maxPnl - minPnl)) * h;
     };
 
-    const equityPts = series.map((s) => ({ x: xAtTime(s.t), y: yMoney(s.equity) }));
-    const cashPts = series.map((s) => ({ x: xAtTime(s.t), y: yMoney(s.cash) }));
-    const pnlPts = series.map((s) => ({ x: xAtTime(s.t), y: yPnl(s.pnl) }));
-    const posPts = series.map((s) => ({ x: xAtTime(s.t), y: yPos(s.positions) }));
-    const ddPts = series.map((s) => ({ x: xAtTime(s.t), y: yDd(s.drawdownPct) }));
+    const equityPts = plotSeries.map((s) => ({ x: xAtTime(s.t), y: yMoney(s.equity) }));
+    const cashPts = plotSeries.map((s) => ({ x: xAtTime(s.t), y: yMoney(s.cash) }));
+    const pnlPts = plotSeries.map((s) => ({ x: xAtTime(s.t), y: yPnl(s.pnl) }));
+    const posPts = plotSeries.map((s) => ({ x: xAtTime(s.t), y: yPos(s.positions) }));
+    const ddPts = plotSeries.map((s) => ({ x: xAtTime(s.t), y: yDd(s.drawdownPct) }));
 
     const moneyTicks = niceMoneyTicks(minM, maxM, 5).map((v) => ({
       y: yMoney(v),
@@ -504,7 +506,7 @@ export function PaperSessionChart({
       yDd,
       pointCount: series.length,
       hasSeries: series.length >= 1,
-      fitted: domain.fitted,
+      sparse: domain.sparse,
       pnlPositive: chartPnl >= 0,
     };
   }, [
@@ -661,7 +663,7 @@ export function PaperSessionChart({
           </div>
           <p className="text-[11px] tabular-nums text-muted">
             {loadingHistory ? "Maj…" : `${series.length} pts`}
-            {geometry.fitted ? " · zoom auto" : ""} ·{" "}
+            {geometry.sparse ? " · historique encore court" : ""} ·{" "}
             {RANGE_OPTIONS.find((o) => o.id === range)?.label ?? range}
             {hoverSample
               ? ` · ${formatAxisTime(hoverSample.t, geometry.span)}`
