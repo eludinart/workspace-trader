@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from datetime import datetime, timezone
 from typing import Any
@@ -269,6 +270,100 @@ class Store:
                         WHERE id=%s
                         """,
                         (False, _SINGLETON_ID),
+                    )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+    @staticmethod
+    def _parse_close_requests(raw: Any) -> list[str]:
+        if raw is None:
+            return []
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return []
+        if not isinstance(raw, list):
+            return []
+        out: list[str] = []
+        for item in raw:
+            if isinstance(item, str) and item.strip():
+                sym = item.strip().upper()
+                if sym not in out:
+                    out.append(sym)
+            elif isinstance(item, dict):
+                sym = str(item.get("symbol") or "").strip().upper()
+                if sym and sym not in out:
+                    out.append(sym)
+        return out
+
+    def enqueue_close(self, symbol: str) -> list[str]:
+        """Ask the lease owner to fully close one paper position."""
+        sym = symbol.strip().upper()
+        if not sym:
+            return self.peek_close_requests()
+        with get_conn() as conn:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT close_requests FROM runtime_meta WHERE id = %s",
+                        (_SINGLETON_ID,),
+                    )
+                    row = cur.fetchone()
+                    pending = self._parse_close_requests(row[0] if row else None)
+                    if sym not in pending:
+                        pending.append(sym)
+                    cur.execute(
+                        """
+                        INSERT INTO runtime_meta (id, close_requests, updated_at)
+                        VALUES (%s, %s, CURRENT_TIMESTAMP)
+                        ON CONFLICT (id) DO UPDATE SET
+                          close_requests = EXCLUDED.close_requests,
+                          updated_at = CURRENT_TIMESTAMP
+                        """,
+                        (_SINGLETON_ID, Json(pending)),
+                    )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+        return pending
+
+    def peek_close_requests(self) -> list[str]:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT close_requests FROM runtime_meta WHERE id = %s",
+                    (_SINGLETON_ID,),
+                )
+                row = cur.fetchone()
+        return self._parse_close_requests(row[0] if row else None)
+
+    def clear_close_requests(self, symbols: list[str] | None = None) -> None:
+        with get_conn() as conn:
+            try:
+                with conn.cursor() as cur:
+                    if symbols is None:
+                        remaining: list[str] = []
+                    else:
+                        drop = {s.strip().upper() for s in symbols if s.strip()}
+                        cur.execute(
+                            "SELECT close_requests FROM runtime_meta WHERE id = %s",
+                            (_SINGLETON_ID,),
+                        )
+                        row = cur.fetchone()
+                        remaining = [
+                            s for s in self._parse_close_requests(row[0] if row else None) if s not in drop
+                        ]
+                    cur.execute(
+                        """
+                        UPDATE runtime_meta
+                        SET close_requests=%s, updated_at=CURRENT_TIMESTAMP
+                        WHERE id=%s
+                        """,
+                        (Json(remaining), _SINGLETON_ID),
                     )
                 conn.commit()
             except Exception:

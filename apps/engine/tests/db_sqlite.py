@@ -89,6 +89,7 @@ CREATE TABLE IF NOT EXISTS runtime_meta (
   migrated_at TEXT,
   reset_requested INTEGER NOT NULL DEFAULT 0,
   reset_balance REAL,
+  close_requests TEXT NOT NULL DEFAULT '[]',
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 INSERT OR IGNORE INTO runtime_meta (id) VALUES (1);

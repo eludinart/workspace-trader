@@ -227,6 +227,10 @@ class KillBody(BaseModel):
     reason: str = "manual"
 
 
+class ClosePositionBody(BaseModel):
+    symbol: str = Field(min_length=3, max_length=32)
+
+
 class BacktestBody(BaseModel):
     symbol: str = "BTC-USD"
     start: datetime
@@ -302,6 +306,20 @@ def get_equity_history(range: str = "1h") -> dict[str, Any]:
 def get_positions() -> dict[str, Any]:
     state = runtime.account_state()
     return {"positions": state["positions"], "cash": state["cash"]}
+
+
+@app.post("/positions/close")
+def close_position(body: ClosePositionBody) -> dict[str, Any]:
+    """Fully sell one open paper position (manual). Queued for the lease owner when split."""
+    try:
+        result = runtime.close_position(body.symbol)
+    except LeaseLost as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=result.get("reason") or "close failed")
+    return result
 
 
 @app.get("/trades")

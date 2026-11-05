@@ -18,7 +18,7 @@ _MAX_SIZE_EPS = 0.995
 class OrderPlan:
     side: str  # buy | sell | hold
     sell_fraction: float
-    reason: str  # signal | tp | sl | kill | hold | max_size | flat | cooldown | max_symbols | budget | fee_guard | min_hold
+    reason: str  # signal | tp | sl | kill | manual | hold | max_size | flat | cooldown | max_symbols | budget | fee_guard | min_hold
     note: str
 
 

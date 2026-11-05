@@ -48,6 +48,7 @@ _NOTE_REASONS = {
     "exit:tp": "tp",
     "exit:sl": "sl",
     "exit:kill": "kill",
+    "exit:manual": "manual",
     "entry:signal": "signal",
     "exit:signal": "signal",
     "hold:budget": "budget",
@@ -429,8 +430,14 @@ class TradingRuntime:
         while self.stream_alive:
             try:
                 await asyncio.to_thread(self._refresh_price_only)
+                closed: list[dict[str, Any]] = []
+                try:
+                    async with self._lock:
+                        closed = await asyncio.to_thread(self._apply_pending_closes)
+                except (LeaseLost, PersistenceError) as exc:
+                    logger.error("pending close failed: %s", exc)
                 self._record_equity_sample()
-                await self.publish_live("price")
+                await self.publish_live("close" if closed else "price")
             except Exception as exc:  # noqa: BLE001
                 logger.warning("price loop: %s", exc)
             await asyncio.sleep(2)
@@ -595,6 +602,13 @@ class TradingRuntime:
                     break
                 try:
                     await asyncio.to_thread(self._apply_pending_reset)
+                except (LeaseLost, PersistenceError) as exc:
+                    self.last_error = str(exc)
+                    logger.error("fail-closed: %s", exc)
+                    self.running = False
+                    break
+                try:
+                    await asyncio.to_thread(self._apply_pending_closes)
                 except (LeaseLost, PersistenceError) as exc:
                     self.last_error = str(exc)
                     logger.error("fail-closed: %s", exc)
@@ -788,6 +802,7 @@ class TradingRuntime:
                 "exit:tp": "Take-profit hit",
                 "exit:sl": "Stop-loss hit",
                 "exit:kill": "Kill switch flatten",
+                "exit:manual": "Manual close",
             }.get(note, "Forced exit")
         if note and note not in explanation:
             explanation = f"{explanation} | {note}"
@@ -1237,6 +1252,90 @@ class TradingRuntime:
         if not self._confirm_lease(respect_release=False):
             raise LeaseLost("reset refused: lease not held")
         self._reset_owned(balance)
+
+    def _apply_pending_closes(self) -> list[dict[str, Any]]:
+        """Apply queued manual closes. Only the live lease owner may fill."""
+        if self.store is None or self.lease is None:
+            return []
+        symbols = self.store.peek_close_requests()
+        if not symbols:
+            return []
+        if not self._confirm_lease(respect_release=False):
+            raise LeaseLost("close refused: lease not held")
+        closed: list[dict[str, Any]] = []
+        done: list[str] = []
+        for sym in symbols:
+            result = self._close_position_owned(sym)
+            done.append(sym)
+            closed.append(result)
+        self.store.clear_close_requests(done)
+        if closed:
+            self._persist_state()
+        return closed
+
+    def _close_position_owned(self, symbol: str) -> dict[str, Any]:
+        sym = symbol.strip().upper()
+        pos = self.wallet.get_position(sym)
+        if pos is None:
+            return {
+                "ok": True,
+                "symbol": sym,
+                "closed": False,
+                "reason": "flat",
+                "trade": None,
+            }
+        price = self.prices.get(sym)
+        if price is None:
+            price = self._cache_ticker(sym)
+        if price is None:
+            price = float(pos.avg_entry)
+        trade = self._sell_qty(sym, pos.qty, float(price), "exit:manual")
+        if trade is None:
+            return {
+                "ok": False,
+                "symbol": sym,
+                "closed": False,
+                "reason": "sell_failed",
+                "trade": None,
+            }
+        self._journal_fill(trade, None, "exit:manual")
+        return {
+            "ok": True,
+            "symbol": sym,
+            "closed": True,
+            "reason": "manual",
+            "trade": trade.to_dict(),
+        }
+
+    def close_position(self, symbol: str) -> dict[str, Any]:
+        """Fully close one paper position.
+
+        API process (store, no lease) enqueues the symbol; the trader fills it.
+        Legacy JSON mode (no store) closes immediately.
+        """
+        sym = str(symbol or "").strip().upper()
+        if not sym:
+            return {"ok": False, "symbol": "", "closed": False, "reason": "invalid_symbol"}
+        leased = self.store is not None and self.lease is not None and self._confirm_lease(
+            respect_release=False
+        )
+        if self.store is not None and not leased:
+            pending = self.store.enqueue_close(sym)
+            state = self.account_state()
+            return {
+                "ok": True,
+                "symbol": sym,
+                "closed": False,
+                "queued": True,
+                "pending": pending,
+                "reason": "queued",
+                "account": state,
+            }
+        result = self._close_position_owned(sym)
+        self._persist_state()
+        result["queued"] = False
+        result["account"] = self.account_state()
+        return result
 
     def _reset_owned(self, initial_balance: float | None) -> dict[str, Any]:
         bal = initial_balance if initial_balance is not None else self.params.initial_balance

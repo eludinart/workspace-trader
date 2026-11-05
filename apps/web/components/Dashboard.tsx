@@ -576,6 +576,31 @@ export function Dashboard() {
     }
   }
 
+  function sellPosition(symbol: string) {
+    void run(
+      `close-${symbol}`,
+      async () => {
+        const res = await api.closePosition(symbol);
+        if (res.account) setAccount(res.account);
+      },
+      {
+        confirm: `Vendre toute la position ${symbol} au marché paper ?`,
+        successMessage: `Vente ${symbol} demandée.`,
+        optimistic: () => {
+          setAccount((prev) => {
+            if (!prev) return prev;
+            const positions = prev.positions.filter((p) => p.symbol !== symbol);
+            return {
+              ...prev,
+              positions,
+              open_count: positions.length,
+            };
+          });
+        },
+      },
+    );
+  }
+
   function actionLabelBusy(id: string, idle: string) {
     return pendingAction === id ? "…" : idle;
   }
@@ -690,7 +715,9 @@ export function Dashboard() {
       : Boolean(params.auto_trade);
 
   const pendingBannerLabel = pendingAction
-    ? ACTION_LABELS[pendingAction] || pendingAction
+    ? pendingAction.startsWith("close-")
+      ? ACTION_LABELS.close
+      : ACTION_LABELS[pendingAction] || pendingAction
     : null;
 
   return (
@@ -838,14 +865,31 @@ export function Dashboard() {
           {(account?.positions || []).length === 0 ? (
             <p className="text-sm text-muted">Aucune</p>
           ) : (
-            account?.positions.map((p) => (
-              <div key={p.symbol} className="flex justify-between text-sm">
-                <span>
-                  {p.symbol} · {p.qty.toFixed(6)}
-                </span>
-                <span className={pnlClass(p.unrealized_pnl)}>{money(p.unrealized_pnl)}</span>
-              </div>
-            ))
+            <ul className="space-y-2">
+              {account?.positions.map((p) => (
+                <li key={p.symbol} className="flex items-center justify-between gap-2 text-sm">
+                  <button
+                    type="button"
+                    className="min-w-0 flex-1 text-left"
+                    title="Voir sur le graphique"
+                    onClick={() => void changeChartSymbol(p.symbol)}
+                  >
+                    <span className="font-medium">{p.symbol}</span>
+                    <span className="text-muted"> · {p.qty.toFixed(6)} </span>
+                    <span className={pnlClass(p.unrealized_pnl)}>{money(p.unrealized_pnl)}</span>
+                  </button>
+                  <button
+                    type="button"
+                    className="shrink-0 rounded-md border border-loss/40 px-2 py-1 text-xs font-semibold text-loss hover:bg-loss/10 disabled:opacity-50"
+                    disabled={busy}
+                    title={`Vendre ${p.symbol}`}
+                    onClick={() => sellPosition(p.symbol)}
+                  >
+                    {actionLabelBusy(`close-${p.symbol}`, "Vendre")}
+                  </button>
+                </li>
+              ))}
+            </ul>
           )}
         </div>
         <div className="card col-span-2">
@@ -1171,25 +1215,39 @@ export function Dashboard() {
           ) : (
             <ul className="space-y-2 text-sm">
               {account?.positions.map((p) => (
-                <li key={p.symbol}>
-                  <button
-                    type="button"
-                    className={`w-full rounded-lg border p-2 text-left transition-colors ${
-                      chartSymbol === p.symbol
-                        ? "border-riskBlue/60 bg-riskBlue/10"
-                        : "border-line hover:border-slate-600"
-                    }`}
-                    title="Voir sur le graphique"
-                    onClick={() => void changeChartSymbol(p.symbol)}
-                  >
-                    <div className="flex justify-between font-medium">
-                      <span>{p.symbol}</span>
-                      <span className={pnlClass(p.unrealized_pnl)}>{money(p.unrealized_pnl)}</span>
-                    </div>
-                    <p className="text-muted">
-                      qté {p.qty.toFixed(6)} · entrée {money(p.avg_entry)} · cours {money(p.mark_price)}
-                    </p>
-                  </button>
+                <li
+                  key={p.symbol}
+                  className={`rounded-lg border p-2 transition-colors ${
+                    chartSymbol === p.symbol
+                      ? "border-riskBlue/60 bg-riskBlue/10"
+                      : "border-line"
+                  }`}
+                >
+                  <div className="flex items-start gap-2">
+                    <button
+                      type="button"
+                      className="min-w-0 flex-1 text-left hover:opacity-90"
+                      title="Voir sur le graphique"
+                      onClick={() => void changeChartSymbol(p.symbol)}
+                    >
+                      <div className="flex justify-between font-medium">
+                        <span>{p.symbol}</span>
+                        <span className={pnlClass(p.unrealized_pnl)}>{money(p.unrealized_pnl)}</span>
+                      </div>
+                      <p className="text-muted">
+                        qté {p.qty.toFixed(6)} · entrée {money(p.avg_entry)} · cours {money(p.mark_price)}
+                      </p>
+                    </button>
+                    <button
+                      type="button"
+                      className="shrink-0 rounded-md border border-loss/40 px-2.5 py-1.5 text-xs font-semibold text-loss hover:bg-loss/10 disabled:opacity-50"
+                      disabled={busy}
+                      title={`Vendre toute la position ${p.symbol}`}
+                      onClick={() => sellPosition(p.symbol)}
+                    >
+                      {actionLabelBusy(`close-${p.symbol}`, "Vendre")}
+                    </button>
+                  </div>
                 </li>
               ))}
             </ul>

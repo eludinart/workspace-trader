@@ -151,11 +151,57 @@ export function PaperSessionChart({
   const lastPush = useRef(0);
   const lastSample = useRef<PaperSample | null>(null);
   const rangeRef = useRef(range);
+  const liveRef = useRef({ equity, cash, positions, pnl });
   rangeRef.current = range;
+  liveRef.current = { equity, cash, positions, pnl };
 
   useEffect(() => {
     setRange(loadRange());
   }, []);
+
+  const pushLiveSample = useCallback(
+    (force = false) => {
+      const snap = liveRef.current;
+      if (!Number.isFinite(snap.equity) || !Number.isFinite(snap.cash)) return;
+      const now = Date.now();
+      const prev = lastSample.current;
+      const moved =
+        !prev ||
+        Math.abs(prev.equity - snap.equity) >= 0.05 ||
+        Math.abs(prev.cash - snap.cash) >= 0.05 ||
+        prev.positions !== snap.positions ||
+        Math.abs(prev.pnl - snap.pnl) >= 0.05;
+      if (!force && prev && !moved && now - lastPush.current < 2000) return;
+
+      const cutoff = rangeCutoffMs(rangeRef.current, sessionStartedAt);
+      if (cutoff != null && now < cutoff) return;
+
+      lastPush.current = now;
+      peakInView.current =
+        peakInView.current == null ? snap.equity : Math.max(peakInView.current, snap.equity);
+      const peak = peakInView.current > 0 ? peakInView.current : snap.equity;
+      const drawdownPct = peak > 0 ? Math.max(0, ((peak - snap.equity) / peak) * 100) : 0;
+      const sample: PaperSample = {
+        t: now,
+        equity: snap.equity,
+        cash: snap.cash,
+        positions: Math.max(0, snap.positions),
+        pnl: snap.pnl,
+        drawdownPct,
+      };
+      lastSample.current = sample;
+      setSeries((s) => {
+        const base = s.filter((p) => (cutoff == null ? true : p.t >= cutoff));
+        const withoutDup =
+          base.length && Math.abs(base[base.length - 1].t - sample.t) < 400
+            ? base.slice(0, -1)
+            : base;
+        const next = [...withoutDup, sample];
+        return next.length > maxPoints ? next.slice(-maxPoints) : next;
+      });
+    },
+    [maxPoints, sessionStartedAt],
+  );
 
   const applyHistory = useCallback(async (nextRange: PaperTimeRange) => {
     setLoadingHistory(true);
@@ -174,18 +220,24 @@ export function PaperSessionChart({
         pnl: Number(p.pnl) || 0,
         drawdownPct: Number(p.drawdown_pct) || 0,
       }));
-      peakInView.current = mapped.reduce(
-        (m, s) => Math.max(m, s.equity),
-        mapped[0]?.equity ?? 0,
-      );
-      lastSample.current = mapped[mapped.length - 1] ?? null;
-      setSeries(mapped.length ? mapped : []);
+      setSeries((prev) => {
+        const lastHistT = mapped.length ? mapped[mapped.length - 1].t : 0;
+        const liveTail = prev.filter((p) => p.t > lastHistT + 250);
+        const merged = [...mapped, ...liveTail];
+        const next = merged.length ? merged : prev;
+        peakInView.current = next.reduce(
+          (m, s) => Math.max(m, s.equity),
+          next[0]?.equity ?? liveRef.current.equity,
+        );
+        lastSample.current = next[next.length - 1] ?? null;
+        return next.length > maxPoints ? next.slice(-maxPoints) : next;
+      });
     } catch (err) {
       setHistoryError(err instanceof Error ? err.message : "Historique indisponible");
     } finally {
       setLoadingHistory(false);
     }
-  }, []);
+  }, [maxPoints]);
 
   useEffect(() => {
     void applyHistory(range);
@@ -200,41 +252,16 @@ export function PaperSessionChart({
     }
   }
 
-  // Append live ticks into the active window.
+  // Keep drawing even when equity is flat: props alone do not re-fire.
   useEffect(() => {
-    if (!Number.isFinite(equity) || !Number.isFinite(cash)) return;
-    const now = Date.now();
-    const prev = lastSample.current;
-    const moved =
-      !prev ||
-      Math.abs(prev.equity - equity) >= 0.05 ||
-      Math.abs(prev.cash - cash) >= 0.05 ||
-      prev.positions !== positions;
-    if (prev && !moved && now - lastPush.current < 1500) return;
+    pushLiveSample(true);
+    const timer = window.setInterval(() => pushLiveSample(false), 2000);
+    return () => window.clearInterval(timer);
+  }, [pushLiveSample]);
 
-    const cutoff = rangeCutoffMs(rangeRef.current, sessionStartedAt);
-    if (cutoff != null && now < cutoff) return;
-
-    lastPush.current = now;
-    peakInView.current =
-      peakInView.current == null ? equity : Math.max(peakInView.current, equity);
-    const peak = peakInView.current > 0 ? peakInView.current : equity;
-    const drawdownPct = peak > 0 ? Math.max(0, ((peak - equity) / peak) * 100) : 0;
-    const sample: PaperSample = {
-      t: now,
-      equity,
-      cash,
-      positions: Math.max(0, positions),
-      pnl,
-      drawdownPct,
-    };
-    lastSample.current = sample;
-    setSeries((s) => {
-      const base = s.filter((p) => (cutoff == null ? true : p.t >= cutoff));
-      const next = [...base, sample];
-      return next.length > maxPoints ? next.slice(-maxPoints) : next;
-    });
-  }, [equity, cash, positions, pnl, maxPoints, sessionStartedAt]);
+  useEffect(() => {
+    pushLiveSample(true);
+  }, [equity, cash, positions, pnl, pushLiveSample]);
 
   const latest = series[series.length - 1];
   const chartPnl = latest?.pnl ?? pnl;
@@ -291,9 +318,11 @@ export function PaperSessionChart({
       ? series[series.length - 1].t - series[0].t
       : 0;
     const coverageNote =
-      dataSpan > 0 && dataSpan < span * 0.35
-        ? `Données depuis ${formatAxisTime(series[0].t, span)} (historique encore court)`
-        : null;
+      series.length < 2
+        ? "Courbe en construction — échantillonnage live en cours"
+        : dataSpan > 0 && dataSpan < span * 0.35
+          ? `Données depuis ${formatAxisTime(series[0].t, span)} (historique encore court)`
+          : null;
 
     // Mid tick for long windows so the domain is obvious.
     const mid = domain.start + span / 2;
@@ -303,12 +332,19 @@ export function PaperSessionChart({
       { x: PAD.left + innerW, label: formatAxisTime(domain.end, span) },
     ];
 
+    const lastEquity = equityPts[equityPts.length - 1] ?? null;
+    const lastCash = cashPts[cashPts.length - 1] ?? null;
+    const lastPnl = pnlPts[pnlPts.length - 1] ?? null;
+
     return {
       equityPts,
       cashPts,
       pnlPts,
       posPts,
       ddPts,
+      lastEquity,
+      lastCash,
+      lastPnl,
       gridY,
       ddTicks,
       timeTicks,
@@ -474,6 +510,34 @@ export function PaperSessionChart({
             stroke={COLORS.equity}
             strokeWidth={2.25}
           />
+          {geometry.pointCount === 1 && geometry.lastEquity ? (
+            <>
+              {geometry.lastCash ? (
+                <circle
+                  cx={geometry.lastCash.x}
+                  cy={geometry.lastCash.y}
+                  r={3.5}
+                  fill={COLORS.cash}
+                />
+              ) : null}
+              {geometry.lastPnl ? (
+                <circle
+                  cx={geometry.lastPnl.x}
+                  cy={geometry.lastPnl.y}
+                  r={3.5}
+                  fill={geometry.pnlPositive ? COLORS.pnl : COLORS.pnlNeg}
+                />
+              ) : null}
+              <circle
+                cx={geometry.lastEquity.x}
+                cy={geometry.lastEquity.y}
+                r={4.5}
+                fill={COLORS.equity}
+                stroke="#0b1220"
+                strokeWidth={1.5}
+              />
+            </>
+          ) : null}
           {geometry.timeTicks.map((tick, i) => (
             <text
               key={`t-${tick.x}-${tick.label}`}

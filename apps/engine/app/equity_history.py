@@ -23,6 +23,8 @@ _RANGE_DELTA: dict[str, timedelta | None] = {
 # ~7 days at 30s cadence, or denser if values move often.
 _MAX_POINTS = 20_000
 _MIN_INTERVAL_SEC = 15.0
+_SPARSE_INTERVAL_SEC = 5.0
+_SPARSE_UNTIL = 40
 _MATERIAL_EQUITY = 0.25
 
 
@@ -56,7 +58,10 @@ class EquityHistory:
                 self._last_equity is None
                 or abs(float(equity) - float(self._last_equity)) >= _MATERIAL_EQUITY
             )
-            if elapsed < _MIN_INTERVAL_SEC and not moved:
+            min_interval = (
+                _SPARSE_INTERVAL_SEC if len(self._points) < _SPARSE_UNTIL else _MIN_INTERVAL_SEC
+            )
+            if elapsed < min_interval and not moved:
                 return False
         peak = float(peak_equity) if peak_equity > 0 else float(equity)
         dd = ((peak - float(equity)) / peak * 100.0) if peak > 0 else 0.0

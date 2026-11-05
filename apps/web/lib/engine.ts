@@ -149,6 +149,19 @@ export const api = {
       method: "POST",
       body: JSON.stringify(initial_balance ? { initial_balance } : {}),
     }),
+  closePosition: (symbol: string) =>
+    engineFetch("/positions/close", {
+      method: "POST",
+      body: JSON.stringify({ symbol }),
+    }) as Promise<{
+      ok: boolean;
+      symbol: string;
+      closed?: boolean;
+      queued?: boolean;
+      reason?: string;
+      account?: Account;
+      trade?: Record<string, unknown> | null;
+    }>,
   backtest: (body: Record<string, unknown>) =>
     engineFetch("/backtest", { method: "POST", body: JSON.stringify(body) }),
   lastBacktest: () => engineFetch("/backtest/last"),

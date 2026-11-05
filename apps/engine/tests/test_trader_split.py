@@ -168,6 +168,45 @@ def test_api_reset_flags_book_until_trader_applies(
         runtime.market.close()
 
 
+def test_api_close_queues_until_trader_applies(
+    store_db: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("app.runtime.save_state", lambda _payload: None)
+    monkeypatch.setattr(
+        "app.market.coinbase.CoinbaseClient.get_ticker",
+        lambda _self, _symbol: {"price": "51000"},
+    )
+    _reset_bot_lease()
+    store = Store()
+    lease = LeaseManager("owner-close")
+    assert lease.acquire()
+    owner = TradingRuntime(store=store, lease=lease)
+    _seed_trade(owner)
+    owner.prices["BTC-USD"] = 51_000.0
+    owner._persist_state()
+
+    api = TradingRuntime(store=Store())
+    result = api.close_position("BTC-USD")
+    assert result["ok"] is True
+    assert result["queued"] is True
+    assert result["closed"] is False
+    assert "BTC-USD" in store.peek_close_requests()
+    mid = TradingRuntime(store=Store())
+    assert mid.store is not None and mid.store.load_runtime(mid) is True
+    assert "BTC-USD" in mid.wallet.positions
+
+    closed = owner._apply_pending_closes()
+    assert len(closed) == 1
+    assert closed[0]["closed"] is True
+    assert store.peek_close_requests() == []
+    done = TradingRuntime(store=Store())
+    assert done.store is not None and done.store.load_runtime(done) is True
+    assert "BTC-USD" not in done.wallet.positions
+
+    for runtime in (owner, api, mid, done):
+        runtime.market.close()
+
+
 def test_stop_waits_for_inflight_tick(store_db: None) -> None:
     runtime = TradingRuntime(store=Store())
     release = threading.Event()
