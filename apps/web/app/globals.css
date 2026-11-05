@@ -23,7 +23,7 @@ button {
 }
 
 .btn {
-  @apply inline-flex items-center justify-center rounded-lg px-3 py-2 text-sm font-medium transition active:scale-[0.98] disabled:opacity-50;
+  @apply inline-flex items-center justify-center rounded-lg px-3 py-2 text-sm font-medium transition active:scale-[0.98] disabled:pointer-events-none disabled:cursor-wait disabled:opacity-50;
 }
 
 .btn-primary {

@@ -93,6 +93,8 @@ export function Dashboard() {
   const [backtest, setBacktest] = useState<Record<string, unknown> | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [pendingAction, setPendingAction] = useState<string | null>(null);
+  const actionLockRef = useRef(false);
   const [live, setLive] = useState(false);
   const [streamPhase, setStreamPhase] = useState<"connecting" | "live" | "reconnecting">("connecting");
   const [btStart, setBtStart] = useState(() => {
@@ -122,46 +124,53 @@ export function Dashboard() {
     if (cndl.symbol) setChartSymbol(cndl.symbol);
   }, []);
 
+  const refreshCore = useCallback(async () => {
+    const [acc, sig, tr, jr, pr, sys, uni] = await Promise.all([
+      api.account(),
+      api.signals(),
+      api.trades(),
+      api.journal(),
+      api.params(),
+      api.systemStatus().catch(() => null),
+      api.universe().catch(() => null),
+    ]);
+    setAccount(acc);
+    setSignals(sig);
+    setTrades(tr.trades || []);
+    setJournal(jr.entries || []);
+    setParams(pr);
+    if (uni) setUniverse(uni);
+    const fromTrades = (tr.trades || [])
+      .map((t: Record<string, unknown>) => tradeToActivity(t))
+      .filter(Boolean) as ActivityEvent[];
+    const fromDec = ((sig.decisions || []) as DecisionLine[])
+      .map((d) =>
+        decisionToActivity({
+          ts: d.ts,
+          symbol: d.symbol,
+          action: d.action,
+          narrative: d.narrative,
+          reason: d.reason,
+        })
+      )
+      .filter(Boolean) as ActivityEvent[];
+    setActivity((prev) => mergeActivity(prev, [...fromTrades, ...fromDec]));
+    if (sys) {
+      setSystemStatus(sys);
+      setSystemStatusLoading(false);
+    }
+    return { acc, pr };
+  }, []);
+
   const refresh = useCallback(async () => {
     try {
-      const [acc, sig, tr, jr, pr, al, sys, uni, lastBt] = await Promise.all([
-        api.account(),
-        api.signals(),
-        api.trades(),
-        api.journal(),
-        api.params(),
+      const [{ acc, pr }, al, lastBt] = await Promise.all([
+        refreshCore(),
         api.alertParams(),
-        api.systemStatus().catch(() => null),
-        api.universe().catch(() => null),
         api.lastBacktest().catch(() => null),
       ]);
-      setAccount(acc);
-      setSignals(sig);
-      setTrades(tr.trades || []);
-      if (lastBt && lastBt.ok) setBacktest(lastBt);
-      setJournal(jr.entries || []);
-      setParams(pr);
-      if (uni) setUniverse(uni);
-      const fromTrades = (tr.trades || [])
-        .map((t: Record<string, unknown>) => tradeToActivity(t))
-        .filter(Boolean) as ActivityEvent[];
-      const fromDec = ((sig.decisions || []) as DecisionLine[])
-        .map((d) =>
-          decisionToActivity({
-            ts: d.ts,
-            symbol: d.symbol,
-            action: d.action,
-            narrative: d.narrative,
-            reason: d.reason,
-          })
-        )
-        .filter(Boolean) as ActivityEvent[];
-      setActivity((prev) => mergeActivity(prev, [...fromTrades, ...fromDec]));
       setAlerts(al);
-      if (sys) {
-        setSystemStatus(sys);
-        setSystemStatusLoading(false);
-      }
+      if (lastBt && lastBt.ok) setBacktest(lastBt);
       if (Object.prototype.hasOwnProperty.call(pr, "candle_granularity_sec")) {
         setCandleGranularitySec(normalizeChartTimeframeSec(pr.candle_granularity_sec));
       }
@@ -177,7 +186,7 @@ export function Dashboard() {
     } catch (e) {
       setError(e instanceof Error ? e.message : "Erreur de chargement");
     }
-  }, []);
+  }, [refreshCore]);
 
   const changeChartTimeframe = useCallback(
     async (seconds: number) => {
@@ -466,16 +475,42 @@ export function Dashboard() {
     };
   }, [fetchCandles]);
 
-  async function run(action: () => Promise<unknown>) {
+  async function run(
+    actionId: string,
+    action: () => Promise<unknown>,
+    opts?: {
+      confirm?: string;
+      optimistic?: () => void;
+    },
+  ) {
+    if (actionLockRef.current) return;
+    if (opts?.confirm && !window.confirm(opts.confirm)) return;
+    actionLockRef.current = true;
     setBusy(true);
+    setPendingAction(actionId);
+    setError(null);
+    opts?.optimistic?.();
     try {
       await action();
-      await refresh();
+      // Fast path after click: skip candles/backtest so the UI unlocks sooner.
+      await refreshCore();
+      setError(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Action échouée");
+      try {
+        await refreshCore();
+      } catch {
+        /* keep original error */
+      }
     } finally {
+      actionLockRef.current = false;
+      setPendingAction(null);
       setBusy(false);
     }
+  }
+
+  function actionLabelBusy(id: string, idle: string) {
+    return pendingAction === id ? "…" : idle;
   }
 
   async function saveParams(e: FormEvent<HTMLFormElement>) {
@@ -536,7 +571,7 @@ export function Dashboard() {
       if (!Number.isNaN(n)) body[key] = n;
     }
 
-    await run(() => api.putParams(body));
+    await run("save-params", () => api.putParams(body));
   }
 
   async function saveAlerts(e: FormEvent<HTMLFormElement>) {
@@ -552,12 +587,15 @@ export function Dashboard() {
       pnl_alert_threshold: Number(fd.get("pnl_alert_threshold") || 100),
       strong_signal_threshold: Number(fd.get("strong_signal_threshold") || 0.75),
     };
-    await run(() => api.putAlerts(body));
+    await run("save-alerts", () => api.putAlerts(body));
   }
 
   async function runBacktest(e: FormEvent) {
     e.preventDefault();
+    if (actionLockRef.current) return;
+    actionLockRef.current = true;
     setBusy(true);
+    setPendingAction("backtest");
     try {
       const res = await api.backtest({
         symbol: String(params.symbol || "BTC-USD"),
@@ -570,6 +608,8 @@ export function Dashboard() {
     } catch (err) {
       setError(err instanceof Error ? err.message : "Backtest échoué");
     } finally {
+      actionLockRef.current = false;
+      setPendingAction(null);
       setBusy(false);
     }
   }
@@ -677,7 +717,7 @@ export function Dashboard() {
           defaultCollapsed
           onPick={(sym) => void changeChartSymbol(sym)}
           onRefresh={() =>
-            void run(async () => {
+            void run("refresh-universe", async () => {
               const uni = await api.refreshUniverse();
               setUniverse(uni);
               if (uni.symbols?.length) {
@@ -750,14 +790,17 @@ export function Dashboard() {
         <div className="card col-span-2">
           <NewsPanel brief={newsBrief} loading={newsLoading} compact />
         </div>
-        <div className="col-span-2 grid grid-cols-2 gap-2">
+        <div
+          className={`col-span-2 grid grid-cols-2 gap-2 ${busy ? "pointer-events-none opacity-80" : ""}`}
+          aria-busy={busy}
+        >
           <button
             className="btn-primary"
             disabled={busy}
             title="Force une décision IA immédiate (un tick paper)."
-            onClick={() => void run(() => api.tick())}
+            onClick={() => void run("tick", () => api.tick())}
           >
-            Décider
+            {actionLabelBusy("tick", "Décider")}
           </button>
           <button
             className={botRunning ? "btn-ghost" : "btn-primary"}
@@ -767,25 +810,46 @@ export function Dashboard() {
                 ? "Arrête la boucle de décisions ; positions et cash conservés."
                 : "Démarre la boucle automatique de décisions paper."
             }
-            onClick={() => void run(() => (botRunning ? api.stop() : api.start()))}
+            onClick={() =>
+              void run("loop", () => (botRunning ? api.stop() : api.start()), {
+                optimistic: () =>
+                  setAccount((prev) =>
+                    prev ? { ...prev, bot_running: !botRunning } : prev,
+                  ),
+              })
+            }
           >
-            {botRunning ? "Arrêter" : "Démarrer"}
+            {actionLabelBusy("loop", botRunning ? "Arrêter" : "Démarrer")}
           </button>
           <button
             className="btn-danger"
             disabled={busy}
             title="Kill switch : bloque les nouveaux ordres paper."
-            onClick={() => void run(() => api.kill())}
+            onClick={() =>
+              void run("kill", () => api.kill(), {
+                optimistic: () =>
+                  setAccount((prev) =>
+                    prev ? { ...prev, killed: true, auto_trade: false } : prev,
+                  ),
+              })
+            }
           >
-            Urgence
+            {actionLabelBusy("kill", "Urgence")}
           </button>
           <button
             className="btn-ok col-span-2"
             disabled={busy}
             title="Reprend après un arrêt ou une urgence."
-            onClick={() => void run(() => api.resume())}
+            onClick={() =>
+              void run("resume", () => api.resume(), {
+                optimistic: () =>
+                  setAccount((prev) =>
+                    prev ? { ...prev, killed: false, kill_reason: null, bot_running: true } : prev,
+                  ),
+              })
+            }
           >
-            Reprendre
+            {actionLabelBusy("resume", "Reprendre")}
           </button>
         </div>
       </section>
@@ -809,7 +873,7 @@ export function Dashboard() {
           defaultCollapsed
           onPick={(sym) => void changeChartSymbol(sym)}
           onRefresh={() =>
-            void run(async () => {
+            void run("refresh-universe", async () => {
               const uni = await api.refreshUniverse();
               setUniverse(uni);
               if (uni.symbols?.length) {
@@ -892,14 +956,22 @@ export function Dashboard() {
             value={`${money(account?.drawdown_pct ?? 0, 1)} %`}
             hint="Baisse maximale depuis le plus haut du compte (drawdown)."
           />
-          <div className="grid grid-cols-2 gap-2 pt-2">
+          <div
+            className={`grid grid-cols-2 gap-2 pt-2 ${busy ? "pointer-events-none opacity-80" : ""}`}
+            aria-busy={busy}
+          >
+            {busy && pendingAction ? (
+              <p className="col-span-2 text-center text-xs text-muted">
+                Action en cours… un seul clic à la fois.
+              </p>
+            ) : null}
             <button
               className="btn-primary"
               disabled={busy}
               title="Force une décision IA immédiate (un tick paper)."
-              onClick={() => void run(() => api.tick())}
+              onClick={() => void run("tick", () => api.tick())}
             >
-              Décider (IA)
+              {actionLabelBusy("tick", "Décider (IA)")}
             </button>
             <button
               className={botRunning ? "btn-ghost" : "btn-primary"}
@@ -909,25 +981,48 @@ export function Dashboard() {
                   ? "Arrête la boucle de décisions ; positions et cash conservés."
                   : "Démarre la boucle automatique de décisions paper."
               }
-              onClick={() => void run(() => (botRunning ? api.stop() : api.start()))}
+              onClick={() =>
+                void run("loop", () => (botRunning ? api.stop() : api.start()), {
+                  optimistic: () =>
+                    setAccount((prev) =>
+                      prev ? { ...prev, bot_running: !botRunning } : prev,
+                    ),
+                })
+              }
             >
-              {botRunning ? "Arrêter" : "Démarrer"}
+              {actionLabelBusy("loop", botRunning ? "Arrêter" : "Démarrer")}
             </button>
             <button
               className="btn-danger"
               disabled={busy}
               title="Kill switch : bloque les nouveaux ordres paper."
-              onClick={() => void run(() => api.kill())}
+              onClick={() =>
+                void run("kill", () => api.kill(), {
+                  optimistic: () =>
+                    setAccount((prev) =>
+                      prev ? { ...prev, killed: true, auto_trade: false } : prev,
+                    ),
+                })
+              }
             >
-              Arrêt d&apos;urgence
+              {actionLabelBusy("kill", "Arrêt d'urgence")}
             </button>
             <button
               className="btn-ok"
               disabled={busy}
               title="Reprend après un arrêt ou une urgence."
-              onClick={() => void run(() => api.resume())}
+              onClick={() =>
+                void run("resume", () => api.resume(), {
+                  optimistic: () =>
+                    setAccount((prev) =>
+                      prev
+                        ? { ...prev, killed: false, kill_reason: null, bot_running: true }
+                        : prev,
+                    ),
+                })
+              }
             >
-              Reprendre
+              {actionLabelBusy("resume", "Reprendre")}
             </button>
             <button
               className={autoTradeOn ? "btn-ghost" : "btn-primary"}
@@ -937,17 +1032,35 @@ export function Dashboard() {
                   ? "Désactive les ordres automatiques (pas de nouveaux trades)."
                   : "Autorise les ordres paper automatiques."
               }
-              onClick={() => void run(() => api.putParams({ auto_trade: !autoTradeOn }))}
+              onClick={() =>
+                void run(
+                  "auto",
+                  () => api.putParams({ auto_trade: !autoTradeOn }),
+                  {
+                    optimistic: () => {
+                      setAccount((prev) =>
+                        prev ? { ...prev, auto_trade: !autoTradeOn } : prev,
+                      );
+                      setParams((prev) => ({ ...prev, auto_trade: !autoTradeOn }));
+                    },
+                  },
+                )
+              }
             >
-              {autoTradeOn ? "Couper auto" : "Activer auto"}
+              {actionLabelBusy("auto", autoTradeOn ? "Couper auto" : "Activer auto")}
             </button>
             <button
               className="btn-ghost"
               disabled={busy}
               title="Remet cash, positions, trades et historique chart au solde initial."
-              onClick={() => void run(() => api.reset())}
+              onClick={() =>
+                void run("reset", () => api.reset(), {
+                  confirm:
+                    "Réinitialiser le compte paper ? Cash, positions et historique seront remis au solde initial.",
+                })
+              }
             >
-              Réinitialiser
+              {actionLabelBusy("reset", "Réinitialiser")}
             </button>
           </div>
         </section>
@@ -1075,12 +1188,18 @@ export function Dashboard() {
                   }
                   disabled={busy}
                   onClick={() =>
-                    void run(async () => {
+                    void run(`style-${style}`, async () => {
                       await api.putParams({ trading_style: style });
                     })
                   }
                 >
-                  {style === "prudent" ? "Prudent" : style === "agressif" ? "Agressif" : "Intermédiaire"}
+                  {pendingAction === `style-${style}`
+                    ? "…"
+                    : style === "prudent"
+                      ? "Prudent"
+                      : style === "agressif"
+                        ? "Agressif"
+                        : "Intermédiaire"}
                 </button>
               ))}
             </div>
