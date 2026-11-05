@@ -53,6 +53,9 @@ Docker is not on PATH here, so `docker compose config` and a live "one lease own
 
 ## Follow-up — review findings 1 and 2
 
+### Commit
+`749fd3e` — `fix: keep account reset and lease release on the owner`
+
 ### Reset (finding 1)
 `POST /account/reset` on the API does not call `wallet.reset` or `save_runtime`. It upserts `runtime_meta.reset_requested` and optional `reset_balance` (`Store.request_reset`) and returns the current account with `reset_accepted: true` and `reset_requested: true` (HTTP 200 so the dashboard refresh still works). Only the lease owner applies the flag: `TradingRuntime._apply_pending_reset` on start and between ticks runs the wallet reset, `save_runtime`, then `clear_reset_request`. `save_runtime` does not touch those columns, so an in-flight tick can write the pre-reset book back and the next loop still applies the reset. A process with no store (legacy JSON) still resets locally. A store-backed runtime whose lease check fails also only sets the flag.
 
