@@ -5,11 +5,23 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
+from app import store as store_module
 from app.config import AlertParams, BotParams
 from app.equity_history import EquityHistory
 from app.journal import DecisionJournal
 from app.store import Store
 from app.wallet import PaperWallet, Position
+
+
+def _runtime_migrated_at() -> str | None:
+    with store_module.get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT migrated_at FROM runtime_meta WHERE id = %s", (1,))
+            row = cur.fetchone()
+    if row is None:
+        return None
+    value = row[0]
+    return str(value) if value is not None else None
 
 
 def _make_runtime() -> SimpleNamespace:
@@ -98,7 +110,25 @@ def test_maybe_migrate_json_imports_paper_state(store_db: None, monkeypatch) -> 
             "positions": [{"symbol": "ETH-USD", "qty": 1.0, "avg_entry": 3000.0}],
             "trades": [],
         },
-        "journal": [],
+        "journal": [
+            {
+                "id": "j-migrate-1",
+                "ts": "2026-01-02T10:00:00+00:00",
+                "symbol": "ETH-USD",
+                "action": "buy",
+                "price": 3000.0,
+                "qty": 1.0,
+                "trade_id": "t-migrate",
+                "confidence": 0.75,
+                "features": {"rsi": 55.0},
+                "top_features": [{"name": "rsi", "value": 55.0}],
+                "explanation": "migrated journal entry",
+                "simulated": False,
+                "source": "live",
+                "note": "",
+                "narrative": "",
+            }
+        ],
         "equity_history": [],
         "last_buy_at": {},
         "signal_history": [],
@@ -106,7 +136,10 @@ def test_maybe_migrate_json_imports_paper_state(store_db: None, monkeypatch) -> 
     monkeypatch.setattr("app.persist.load_state", lambda: payload)
 
     assert import_json_to_store() is True
+    assert _runtime_migrated_at() is not None
     assert import_json_to_store() is False  # account already exists
+    first_migrated_at = _runtime_migrated_at()
+    assert first_migrated_at is not None
 
     loaded = _make_runtime()
     loaded.wallet = PaperWallet(initial_balance=1.0, cash=1.0)
@@ -114,6 +147,14 @@ def test_maybe_migrate_json_imports_paper_state(store_db: None, monkeypatch) -> 
     assert store.load_runtime(loaded) is True  # type: ignore[arg-type]
     assert loaded.wallet.cash == 450.0
     assert "ETH-USD" in loaded.wallet.positions
+    assert len(loaded.journal.entries) == 1
+    entry = loaded.journal.entries[0]
+    assert entry.id == "j-migrate-1"
+    assert entry.symbol == "ETH-USD"
+    assert entry.explanation == "migrated journal entry"
+
+    assert store.maybe_migrate_json() is False
+    assert _runtime_migrated_at() == first_migrated_at
 
 
 def test_store_params_and_audit(store_db: None) -> None:
