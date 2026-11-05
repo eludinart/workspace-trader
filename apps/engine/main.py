@@ -17,8 +17,12 @@ from pydantic import BaseModel, Field
 
 from app.backtest import run_backtest
 from app.config import BotParams
+from app.db import get_conn
+from app.lease import read_lease
+from app.migrate import run_migrations
 from app.news.models import NewsCategory
-from app.runtime import TradingRuntime
+from app.runtime import LeaseLost, TradingRuntime
+from app.store import Store
 
 _LAST_BACKTEST_PATH = Path(__file__).resolve().parent / "data" / "last_backtest.json"
 _BACKTEST_SUMMARY_KEYS = (
@@ -82,14 +86,44 @@ _NEWS_CATEGORIES: dict[str, NewsCategory] = {
 }
 
 logger = logging.getLogger(__name__)
-runtime = TradingRuntime()
+runtime = TradingRuntime(store=Store())
+
+
+def _health_db_lease() -> tuple[dict[str, Any], dict[str, Any]]:
+    empty_lease: dict[str, Any] = {
+        "ok": False,
+        "held": False,
+        "owner_id": None,
+        "heartbeat_at": None,
+        "expires_at": None,
+        "release_requested": False,
+        "version": None,
+    }
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+                cur.fetchone()
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)}, {**empty_lease, "error": "database unavailable"}
+    try:
+        return {"ok": True}, read_lease()
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": True}, {**empty_lease, "error": str(exc)}
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    await runtime.start()
+    # HTTP API only: schema + read model. Trade loops live in the trader worker.
+    try:
+        run_migrations()
+        if runtime.store is not None:
+            runtime.store.maybe_migrate_json()
+        runtime.hydrate()
+    except Exception:
+        logger.exception("API store init failed; /health will report database down")
+        runtime._db_ok = False
     yield
-    await runtime.stop()
     await runtime.shutdown_streams()
     runtime.close()
 
@@ -107,6 +141,17 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def refresh_api_read_model(request: Request, call_next):
+    if request.method == "GET" and runtime.lease is None and runtime.store is not None:
+        try:
+            await asyncio.to_thread(runtime.hydrate)
+        except Exception:
+            logger.warning("read-model refresh failed", exc_info=True)
+            runtime._db_ok = False
+    return await call_next(request)
 
 
 class ParamsUpdate(BaseModel):
@@ -199,12 +244,31 @@ def _mask_alerts() -> dict[str, Any]:
 
 @app.get("/health")
 def health() -> dict[str, Any]:
-    return {
-        "status": "ok",
+    db_status, lease_status = _health_db_lease()
+    if db_status.get("ok"):
+        try:
+            runtime.hydrate()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("health hydrate failed: %s", exc)
+            runtime._db_ok = False
+    body: dict[str, Any] = {
+        "status": "ok" if db_status.get("ok") else "degraded",
         "service": "engine",
         "mode": "paper",
-        **runtime.status(),
+        "role": "api",
+        "trade_loops": False,
+        "db": db_status,
+        "lease": lease_status,
     }
+    try:
+        body.update(runtime.status())
+    except Exception as exc:  # noqa: BLE001
+        body["runtime_error"] = str(exc)
+    body["db"] = db_status
+    body["lease"] = lease_status
+    body["role"] = "api"
+    body["trade_loops"] = bool(runtime.running)
+    return body
 
 
 @app.get("/system/status")
@@ -435,6 +499,8 @@ def bot_resume() -> dict[str, Any]:
 async def bot_tick() -> dict[str, Any]:
     try:
         return await runtime.tick()
+    except LeaseLost as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
@@ -445,15 +511,24 @@ async def stream(_request: Request) -> StreamingResponse:
 
     async def event_gen():
         try:
+            try:
+                await asyncio.to_thread(runtime.hydrate)
+            except Exception:  # noqa: BLE001
+                logger.warning("stream hydrate failed", exc_info=True)
             snapshot = runtime.live_payload("snapshot")
-            yield f"data: {json.dumps(snapshot)}\n\n"
+            yield f"data: {json.dumps(snapshot, default=str)}\n\n"
             while True:
                 try:
-                    event = await asyncio.wait_for(queue.get(), timeout=20)
-                    yield f"data: {json.dumps(event)}\n\n"
+                    event = await asyncio.wait_for(queue.get(), timeout=5)
+                    yield f"data: {json.dumps(event, default=str)}\n\n"
                 except TimeoutError:
-                    now = datetime.now(timezone.utc).isoformat()
-                    yield f"data: {json.dumps({'type': 'heartbeat', 'ts': now})}\n\n"
+                    try:
+                        await asyncio.to_thread(runtime.hydrate)
+                        payload: dict[str, Any] = runtime.live_payload("snapshot")
+                    except Exception:  # noqa: BLE001
+                        now = datetime.now(timezone.utc).isoformat()
+                        payload = {"type": "heartbeat", "ts": now}
+                    yield f"data: {json.dumps(payload, default=str)}\n\n"
         finally:
             runtime.bus.unsubscribe(queue)
 

@@ -13,6 +13,65 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _as_utc(value: datetime | str | None) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if not isinstance(value, datetime):
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value
+
+
+def _iso(value: datetime | str | None) -> str | None:
+    parsed = _as_utc(value)
+    if parsed is None:
+        return None
+    return parsed.isoformat()
+
+
+def read_lease() -> dict:
+    """Public lease view for the API. Database errors propagate (fail-closed)."""
+    with db.get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT owner_id, heartbeat_at, expires_at, release_requested, version
+                FROM bot_lease WHERE id=%s
+                """,
+                (_LEASE_ID,),
+            )
+            row = cur.fetchone()
+    if row is None:
+        return {
+            "ok": False,
+            "held": False,
+            "owner_id": None,
+            "heartbeat_at": None,
+            "expires_at": None,
+            "release_requested": False,
+            "version": None,
+            "error": "bot_lease row missing",
+        }
+    owner_id, heartbeat_at, expires_at, release_requested, version = row
+    exp = _as_utc(expires_at)
+    held = bool(owner_id) and exp is not None and exp >= _utc_now()
+    return {
+        "ok": True,
+        "held": held,
+        "owner_id": owner_id,
+        "heartbeat_at": _iso(heartbeat_at),
+        "expires_at": _iso(expires_at),
+        "release_requested": bool(release_requested),
+        "version": int(version) if version is not None else 0,
+    }
+
+
 class LeaseManager:
     """Postgres-backed mutex: at most one live owner with TTL heartbeat."""
 
@@ -118,11 +177,14 @@ class LeaseManager:
         owner_id, expires_at, _, _ = self._read_row()
         if owner_id != self._owner_id or expires_at is None:
             return False
-        now = _utc_now()
-        if isinstance(expires_at, datetime):
-            exp = expires_at if expires_at.tzinfo else expires_at.replace(tzinfo=timezone.utc)
-            return exp >= now
-        return False
+        exp = _as_utc(expires_at)
+        if exp is None:
+            return False
+        return exp >= _utc_now()
+
+    def release_requested(self) -> bool:
+        _owner_id, _expires_at, requested, _version = self._read_row()
+        return bool(requested)
 
     def _read_row(self) -> tuple:
         with db.get_conn() as conn:

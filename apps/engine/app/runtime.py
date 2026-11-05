@@ -3,11 +3,12 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import datetime, timezone
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from app.alerts import AlertService
 from app.config import AlertParams, BotParams
 from app.events import EventBus
+from app.lease import read_lease
 from app.execution import OrderPlan, buy_spend, cooldown_active, plan_protective, plan_signal
 from app.journal import DecisionJournal
 from app.market.coinbase import CoinbaseClient
@@ -29,7 +30,19 @@ from app.trading_style import apply_style_preset, normalize_style, scan_gates
 from app.universe import UniverseService
 from app.wallet import PaperWallet, Trade
 
+if TYPE_CHECKING:
+    from app.lease import LeaseManager
+    from app.store import Store
+
 logger = logging.getLogger(__name__)
+
+
+class LeaseLost(RuntimeError):
+    """Lease missing, stolen, or the database could not confirm ownership."""
+
+
+class PersistenceError(RuntimeError):
+    """Postgres write failed. Trading must stop rather than continue from memory."""
 
 _NOTE_REASONS = {
     "exit:tp": "tp",
@@ -55,7 +68,10 @@ def _plan_from_note(side: str, note: str) -> OrderPlan:
 
 
 class TradingRuntime:
-    def __init__(self) -> None:
+    def __init__(self, store: Store | None = None, lease: LeaseManager | None = None) -> None:
+        self.store = store
+        self.lease = lease
+        self._db_ok = store is None
         self.params = BotParams()
         self.wallet = PaperWallet(initial_balance=self.params.initial_balance)
         self.market = CoinbaseClient()
@@ -77,6 +93,10 @@ class TradingRuntime:
         self._task: asyncio.Task[None] | None = None
         self._price_task: asyncio.Task[None] | None = None
         self._news_task: asyncio.Task[None] | None = None
+        self._lease_task: asyncio.Task[None] | None = None
+        self._heartbeat_alive = False
+        self._loop_stopped = asyncio.Event()
+        self._loop_stopped.set()
         self._lock = asyncio.Lock()
         self.active_symbol: str = self.params.symbol
         self.last_signal_symbol: str | None = None
@@ -96,7 +116,8 @@ class TradingRuntime:
         # Last known signal snapshot per universe symbol (for UI table).
         self._universe_signals: dict[str, dict[str, Any]] = {}
         self.equity_history = EquityHistory()
-        self._restore_persisted_state()
+        if store is None:
+            self._restore_persisted_state()
 
     def _restore_persisted_state(self) -> None:
         data = load_state()
@@ -135,8 +156,8 @@ class TradingRuntime:
         except Exception as exc:  # noqa: BLE001
             logger.warning("persist restore failed: %s", exc)
 
-    def _persist_state(self) -> None:
-        payload = {
+    def _state_payload(self) -> dict[str, Any]:
+        return {
             "saved_at": datetime.now(timezone.utc).isoformat(),
             "peak_equity": self.peak_equity,
             "killed": self.killed,
@@ -156,30 +177,151 @@ class TradingRuntime:
             "last_buy_at": {k: v.isoformat() for k, v in self._last_buy_at.items()},
             "session_started_at": self.equity_history.session_started_at.isoformat(),
             "equity_history": self.equity_history.dump()[-4000:],
+            "exit_levels": self._exit_levels,
         }
+
+    def _persist_state(self) -> None:
+        payload = self._state_payload()
+        if self.store is not None:
+            try:
+                self.store.save_runtime(self)
+            except Exception as exc:  # noqa: BLE001
+                self._db_ok = False
+                raise PersistenceError("database persist failed") from exc
+            self._db_ok = True
+            save_state(payload)
+            return
         save_state(payload)
 
-    def close(self) -> None:
+    def _save_params(self) -> None:
+        if self.store is None:
+            return
+        self.store.save_params(self.params, self.alerts.params)
+        self._db_ok = True
+
+    def _reload_params_only(self) -> None:
+        if self.store is None:
+            return
+        params, alerts = self.store.load_params()
+        self.params = params
+        self.alerts.params = alerts
+        self._db_ok = True
+
+    def _reload_between_ticks(self) -> None:
+        """Postgres is the source of truth between decisions."""
+        if self.store is None:
+            return
+        self.store.load_runtime(self)
+        self._reload_params_only()
+        if self.params.universe_enabled:
+            self.universe.size = int(self.params.universe_size)
+            self.universe.min_volume_usd = float(self.params.universe_min_volume_usd)
+            self.universe.refresh_hours = float(self.params.universe_refresh_hours)
+        self._db_ok = True
+
+    def hydrate(self) -> bool:
+        if self.store is None:
+            return False
         try:
-            self._persist_state()
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("persist on close: %s", exc)
+            self._reload_between_ticks()
+        except Exception:
+            self._db_ok = False
+            raise
+        return True
+
+    def _confirm_lease(self, *, respect_release: bool = False) -> bool:
+        if self.lease is None:
+            return False
+        try:
+            if not self.lease.heartbeat():
+                return False
+            if respect_release and self.lease.release_requested():
+                logger.info("lease release requested for %s", self.lease.owner_id)
+                return False
+            return self.lease.is_owner()
+        except Exception:  # noqa: BLE001
+            logger.exception("lease check failed")
+            self._db_ok = False
+            return False
+
+    def _require_fill_authority(self) -> None:
+        """Only the live lease owner may create paper fills."""
+        if self.lease is None:
+            if self.store is not None:
+                raise LeaseLost("fills are only allowed in the trader process")
+            return
+        if not self._confirm_lease(respect_release=False):
+            raise LeaseLost("lease lost or database unavailable")
+
+    def close(self) -> None:
+        should_persist = False
+        if self.lease is not None:
+            try:
+                should_persist = self.lease.is_owner()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("lease check on close: %s", exc)
+                should_persist = False
+        elif self.store is None:
+            should_persist = True
+        if should_persist:
+            try:
+                self._persist_state()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("persist on close: %s", exc)
         self.market.close()
 
     async def start(self) -> None:
         if self.running:
             return
+        if self.lease is None:
+            logger.info("trade loops stay stopped (API process has no lease)")
+            return
+        if not self._confirm_lease(respect_release=True):
+            raise LeaseLost("cannot start trading loops without a live lease")
         self.running = True
         self.stream_alive = True
+        self._heartbeat_alive = True
+        self._loop_stopped.clear()
         try:
             await asyncio.to_thread(self._ensure_universe, True)
         except Exception as exc:  # noqa: BLE001
             logger.warning("universe on start: %s", exc)
         self._task = asyncio.create_task(self._loop())
+        if self._lease_task is None or self._lease_task.done():
+            self._lease_task = asyncio.create_task(self._lease_heartbeat_loop())
         if self._price_task is None or self._price_task.done():
             self._price_task = asyncio.create_task(self._price_loop())
         if self._news_task is None or self._news_task.done():
             self._news_task = asyncio.create_task(self._news_loop())
+
+    async def _lease_heartbeat_loop(self) -> None:
+        while self._heartbeat_alive:
+            if self.lease is None:
+                return
+            try:
+                if not self.lease.heartbeat() or not self.lease.is_owner():
+                    logger.error("lease lost during heartbeat")
+                    self.running = False
+                    self._db_ok = False
+            except Exception:  # noqa: BLE001
+                logger.exception("lease heartbeat failed; fail-closed")
+                self.running = False
+                self._db_ok = False
+            await asyncio.sleep(5)
+
+    async def wait_loop(self) -> None:
+        await self._loop_stopped.wait()
+
+    async def stop_heartbeat(self) -> None:
+        self._heartbeat_alive = False
+        task = self._lease_task
+        self._lease_task = None
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
     async def _news_loop(self) -> None:
         while self.stream_alive:
@@ -382,39 +524,92 @@ class TradingRuntime:
         await self.bus.publish(self.live_payload(kind))
 
     def engage_kill_switch(self, reason: str = "manual") -> dict[str, Any]:
+        if self.lease is None:
+            self._reload_params_only()
         first = not self.killed
         self.killed = True
         self.kill_reason = reason
         self.params.auto_trade = False
-        self._flatten_all()
-        if first:
-            self.alerts.notify("Kill switch", f"Trading halted: {reason}", kind="kill")
+        owns_fills = self.lease is not None and self._confirm_lease(respect_release=False)
+        if owns_fills or self.store is None:
+            self._flatten_all()
+            if first:
+                self.alerts.notify("Kill switch", f"Trading halted: {reason}", kind="kill")
+            self._save_params()
+            self._persist_state()
+            return self.status()
+        self._save_params()
+        if self.store is not None and not self.store.set_kill(True, reason):
+            self._persist_state()
         return self.status()
 
     def resume_from_kill(self) -> dict[str, Any]:
         self.killed = False
         self.kill_reason = None
+        if self.store is not None:
+            if not self.store.set_kill(False, None):
+                self._persist_state()
+        else:
+            self._persist_state()
         return self.status()
 
+    async def _sleep_interval(self) -> None:
+        remaining = float(self.params.decision_interval_sec)
+        while remaining > 0 and self.running:
+            step = min(1.0, remaining)
+            await asyncio.sleep(step)
+            remaining -= step
+
     async def _loop(self) -> None:
-        while self.running:
-            try:
-                await self.tick()
-                self.last_error = None
-            except Exception as exc:  # noqa: BLE001
-                self.last_error = str(exc)
-                logger.exception("tick failed")
+        try:
+            while self.running:
+                if not self._confirm_lease(respect_release=True):
+                    self.last_error = "lease lost"
+                    logger.error("stopping trade loop: lease lost or database unavailable")
+                    self.running = False
+                    break
                 try:
-                    self._persist_state()
-                except Exception:  # noqa: BLE001
-                    pass
+                    await asyncio.to_thread(self._reload_between_ticks)
+                except Exception as exc:  # noqa: BLE001
+                    self.last_error = f"store reload failed: {exc}"
+                    logger.exception("store reload failed; fail-closed")
+                    self.running = False
+                    break
                 try:
-                    await self.publish_live("error")
-                except Exception:  # noqa: BLE001
-                    pass
-            await asyncio.sleep(self.params.decision_interval_sec)
+                    await self.tick()
+                    self.last_error = None
+                except (LeaseLost, PersistenceError) as exc:
+                    self.last_error = str(exc)
+                    logger.error("fail-closed: %s", exc)
+                    self.running = False
+                    break
+                except Exception as exc:  # noqa: BLE001
+                    self.last_error = str(exc)
+                    logger.exception("tick failed")
+                    try:
+                        self._persist_state()
+                    except (LeaseLost, PersistenceError) as persist_exc:
+                        self.last_error = str(persist_exc)
+                        logger.error("fail-closed: %s", persist_exc)
+                        self.running = False
+                        break
+                    except Exception:  # noqa: BLE001
+                        pass
+                    try:
+                        await self.publish_live("error")
+                    except Exception:  # noqa: BLE001
+                        pass
+                await self._sleep_interval()
+        finally:
+            self.running = False
+            self._loop_stopped.set()
 
     async def tick(self) -> dict[str, Any]:
+        if self.lease is None:
+            if self.store is not None:
+                raise LeaseLost("tick refused: only the trader worker may run decisions")
+        elif not self._confirm_lease(respect_release=False):
+            raise LeaseLost("lease lost or database unavailable")
         async with self._lock:
             result = await asyncio.to_thread(self._tick_sync)
         await self.publish_live("decision")
@@ -494,6 +689,7 @@ class TradingRuntime:
         return float(self.wallet.equity(self.prices_map()))
 
     def _sell_qty(self, symbol: str, qty: float, price: float, note: str) -> Trade | None:
+        self._require_fill_authority()
         pos = self.wallet.get_position(symbol)
         if pos is None or qty <= 0 or price <= 0:
             return None
@@ -724,6 +920,7 @@ class TradingRuntime:
             if spend < 15 or fill <= 0:
                 return None, OrderPlan("hold", 0.0, "budget", "hold:budget")
             qty = spend / (fill * fee_mult)
+            self._require_fill_authority()
             try:
                 trade = self.wallet.buy(
                     symbol, qty=qty, price=fill, fee_bps=self.params.fee_bps, note=plan.note
@@ -963,6 +1160,8 @@ class TradingRuntime:
         )
 
     def update_params(self, patch: dict[str, Any]) -> BotParams:
+        if self.lease is None:
+            self._reload_params_only()
         data = self.params.model_dump()
         clean = {k: v for k, v in patch.items() if v is not None}
         explicit_book = "symbols" in clean or "watchlist" in clean
@@ -993,10 +1192,15 @@ class TradingRuntime:
             self.wallet.reset(new_params.initial_balance)
             self.peak_equity = new_params.initial_balance
             self._last_buy_at.clear()
+        self._save_params()
         return self.params
 
     def update_alerts(self, patch: dict[str, Any]) -> AlertParams:
-        return self.alerts.update_params(patch)
+        if self.lease is None:
+            self._reload_params_only()
+        updated = self.alerts.update_params(patch)
+        self._save_params()
+        return updated
 
     def reset_account(self, initial_balance: float | None = None) -> dict[str, Any]:
         bal = initial_balance if initial_balance is not None else self.params.initial_balance
@@ -1024,6 +1228,7 @@ class TradingRuntime:
             force=True,
         )
         clear_state()
+        self._save_params()
         self._persist_state()
         return self.account_state()
 
@@ -1041,8 +1246,19 @@ class TradingRuntime:
         return prices
 
     def status(self) -> dict[str, Any]:
+        bot_running = self.running
+        if self.lease is None and self.store is not None:
+            try:
+                bot_running = bool(read_lease().get("held"))
+                self._db_ok = True
+            except Exception:  # noqa: BLE001
+                self._db_ok = False
+                bot_running = False
         return {
-            "bot_running": self.running,
+            "bot_running": bot_running,
+            "executor": (
+                "trader" if self.lease is not None else ("api" if self.store is not None else "legacy")
+            ),
             "killed": self.killed,
             "kill_reason": self.kill_reason,
             "auto_trade": self.params.auto_trade,
@@ -1071,10 +1287,29 @@ class TradingRuntime:
         else:
             add("kill", "Arrêt d’urgence", "ok", "Inactif — trading autorisé côté sécurité")
 
-        if self.running:
-            add("bot_loop", "Boucle bot", "ok", f"Tourne toutes les {self.params.decision_interval_sec}s")
+        lease_held = self.running
+        lease_note = "processus local"
+        if self.store is not None:
+            try:
+                snap = read_lease()
+                lease_held = bool(snap.get("held"))
+                owner = snap.get("owner_id") or "aucun"
+                lease_note = f"bail {owner}" + ("" if lease_held else " (expiré ou libre)")
+                self._db_ok = True
+            except Exception as exc:  # noqa: BLE001
+                self._db_ok = False
+                lease_held = False
+                lease_note = f"bail illisible ({exc})"
+
+        if self.running or lease_held:
+            add(
+                "bot_loop",
+                "Boucle bot",
+                "ok",
+                f"Active · {lease_note} · toutes les {self.params.decision_interval_sec}s",
+            )
         else:
-            add("bot_loop", "Boucle bot", "off", "Arrêtée — cliquez Démarrer")
+            add("bot_loop", "Boucle bot", "off", f"Arrêtée · {lease_note}")
 
         if self.params.auto_trade and not self.killed:
             add("auto_trade", "Trading automatique", "ok", "Les ordres paper peuvent être placés")
@@ -1119,7 +1354,22 @@ class TradingRuntime:
         except Exception as exc:  # noqa: BLE001
             add("news", "Actualités", "warn", f"Lecture news: {exc}")
 
-        if STATE_PATH.exists():
+        if self.store is not None:
+            if self._db_ok:
+                add(
+                    "persist",
+                    "Sauvegarde paper",
+                    "ok",
+                    "Postgres est la source de vérité (niveaux de sortie inclus). JSON du volume = copie de secours.",
+                )
+            else:
+                add(
+                    "persist",
+                    "Sauvegarde paper",
+                    "error",
+                    "Postgres injoignable — le trader ne place pas d'ordres",
+                )
+        elif STATE_PATH.exists():
             add(
                 "persist",
                 "Sauvegarde paper",
@@ -1183,6 +1433,12 @@ class TradingRuntime:
         }
 
     def account_state(self) -> dict[str, Any]:
+        if self.lease is None and self.store is not None:
+            try:
+                self.hydrate()
+            except Exception as exc:  # noqa: BLE001
+                self._db_ok = False
+                self.last_error = f"store read failed: {exc}"
         prices = self.prices_map()
         snap = self.wallet.snapshot(prices)
         equity = float(snap["equity"])

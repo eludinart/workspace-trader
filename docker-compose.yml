@@ -21,6 +21,8 @@ services:
       - "8100:8000"
     environment:
       - APP_ENV=production
+      - DATABASE_URL=${DATABASE_URL}
+      - TRADER_CONTROL_TOKEN=${TRADER_CONTROL_TOKEN:-}
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
       - SMTP_HOST=${SMTP_HOST:-}
       - SMTP_PORT=${SMTP_PORT:-587}
@@ -29,6 +31,25 @@ services:
     volumes:
       - engine_data:/app/data
     restart: unless-stopped
+
+  trader:
+    build:
+      context: ./apps/engine
+      dockerfile: Dockerfile
+    command: ["python", "-m", "app.trader_main"]
+    environment:
+      - DATABASE_URL=${DATABASE_URL}
+      - APP_ENV=production
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+      - SMTP_HOST=${SMTP_HOST:-}
+      - SMTP_PORT=${SMTP_PORT:-587}
+      - SMTP_USER=${SMTP_USER:-}
+      - SMTP_PASSWORD=${SMTP_PASSWORD:-}
+    volumes:
+      - engine_data:/app/data
+    restart: unless-stopped
+    depends_on:
+      - engine
 
 volumes:
   engine_data:

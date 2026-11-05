@@ -220,6 +220,33 @@ class Store:
                 conn.rollback()
                 raise
 
+    def set_kill(self, killed: bool, kill_reason: str | None) -> bool:
+        """Update kill flags only. Returns False when the account row does not exist."""
+        with get_conn() as conn:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        UPDATE account
+                        SET killed=%s, kill_reason=%s, updated_at=CURRENT_TIMESTAMP
+                        WHERE id=%s
+                        """,
+                        (killed, kill_reason, _SINGLETON_ID),
+                    )
+                    cur.execute(
+                        "SELECT killed FROM account WHERE id=%s",
+                        (_SINGLETON_ID,),
+                    )
+                    row = cur.fetchone()
+                if row is None:
+                    conn.rollback()
+                    return False
+                conn.commit()
+                return True
+            except Exception:
+                conn.rollback()
+                raise
+
     def load_params(self) -> tuple[BotParams, AlertParams]:
         with get_conn() as conn:
             with conn.cursor() as cur:
