@@ -4,7 +4,7 @@
 Done. The engine process is an HTTP API with no trade loops. A separate `trader` process acquires `bot_lease`, reloads Postgres between ticks, and is the only process allowed to create paper fills.
 
 ## Commit
-Message: `feat: split trader worker from engine API with lease-gated loops`
+`a8fbb08` — `feat: split trader worker from engine API with lease-gated loops`
 
 ## Files
 - `apps/engine/app/trader_main.py` — migrations, `maybe_migrate_json`, lease acquire, `TradingRuntime(store, lease)`, supervise until SIGTERM or lease loss, then `stop` / `shutdown_streams` / `stop_heartbeat` / `close` / `release`
