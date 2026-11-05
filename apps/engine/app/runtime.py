@@ -1417,7 +1417,16 @@ class TradingRuntime:
             return state
         return self._reset_owned(initial_balance)
 
-    def prices_map(self) -> dict[str, float]:
+    def prices_map(self, *, refresh_open: bool = False) -> dict[str, float]:
+        """Mark prices for the book.
+
+        ``refresh_open=True`` pulls a fresh ticker for every open symbol so the
+        UI unrealized PnL is not stuck at entry (common on the API process after
+        hydrate, when ``self.prices`` is empty).
+        """
+        if refresh_open:
+            for sym in list(self.wallet.positions.keys()):
+                self._cache_ticker(sym)
         prices = dict(self.prices)
         if self.params.symbol not in prices:
             if self.last_price is not None:
@@ -1427,7 +1436,13 @@ class TradingRuntime:
                 if px is not None:
                     prices[self.params.symbol] = px
         for sym, pos in self.wallet.positions.items():
-            prices.setdefault(sym, pos.avg_entry)
+            # Prefer a live mark; only fall back to entry when the ticker failed.
+            if sym not in prices or prices[sym] <= 0:
+                px = self._cache_ticker(sym)
+                if px is not None and px > 0:
+                    prices[sym] = px
+                else:
+                    prices.setdefault(sym, pos.avg_entry)
         return prices
 
     def _bot_running_for_ui(self) -> bool:
@@ -1631,7 +1646,9 @@ class TradingRuntime:
             except Exception as exc:  # noqa: BLE001
                 self._db_ok = False
                 self.last_error = f"store read failed: {exc}"
-        prices = self.prices_map()
+        # API process has no price loop — always refresh open marks for truthful PnL.
+        refresh_open = self.lease is None
+        prices = self.prices_map(refresh_open=refresh_open)
         snap = self.wallet.snapshot(prices)
         equity = float(snap["equity"])
         self.peak_equity = max(self.peak_equity, equity)

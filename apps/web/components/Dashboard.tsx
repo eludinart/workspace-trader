@@ -9,6 +9,7 @@ import { LiveEquity } from "@/components/LiveEquity";
 import { LiveOrders } from "@/components/LiveOrders";
 import { NewsPanel } from "@/components/NewsPanel";
 import { PaperSessionChart } from "@/components/PaperSessionChart";
+import { PositionsPanel } from "@/components/PositionsPanel";
 import { SignalText } from "@/components/SignalText";
 import { Candle, PriceChart } from "@/components/PriceChart";
 import {
@@ -862,35 +863,15 @@ export function Dashboard() {
         </div>
         <div className="card col-span-2">
           <p className="label">Positions</p>
-          {(account?.positions || []).length === 0 ? (
-            <p className="text-sm text-muted">Aucune</p>
-          ) : (
-            <ul className="space-y-2">
-              {account?.positions.map((p) => (
-                <li key={p.symbol} className="flex items-center justify-between gap-2 text-sm">
-                  <button
-                    type="button"
-                    className="min-w-0 flex-1 text-left"
-                    title="Voir sur le graphique"
-                    onClick={() => void changeChartSymbol(p.symbol)}
-                  >
-                    <span className="font-medium">{p.symbol}</span>
-                    <span className="text-muted"> · {p.qty.toFixed(6)} </span>
-                    <span className={pnlClass(p.unrealized_pnl)}>{money(p.unrealized_pnl)}</span>
-                  </button>
-                  <button
-                    type="button"
-                    className="shrink-0 rounded-md border border-loss/40 px-2 py-1 text-xs font-semibold text-loss hover:bg-loss/10 disabled:opacity-50"
-                    disabled={busy}
-                    title={`Vendre ${p.symbol}`}
-                    onClick={() => sellPosition(p.symbol)}
-                  >
-                    {actionLabelBusy(`close-${p.symbol}`, "Vendre")}
-                  </button>
-                </li>
-              ))}
-            </ul>
-          )}
+          <PositionsPanel
+            positions={account?.positions || []}
+            chartSymbol={chartSymbol}
+            busy={busy}
+            compact
+            onPick={(sym) => void changeChartSymbol(sym)}
+            onSell={sellPosition}
+            sellLabel={(sym) => actionLabelBusy(`close-${sym}`, "Vendre")}
+          />
         </div>
         <div className="card col-span-2">
           <p className="label">Dernier signal</p>
@@ -1210,48 +1191,18 @@ export function Dashboard() {
 
         <section className="card md:col-span-4">
           <h2 className="mb-2 text-lg font-medium">Positions</h2>
-          {(account?.positions || []).length === 0 ? (
-            <p className="text-sm text-muted">Aucune position ouverte</p>
-          ) : (
-            <ul className="space-y-2 text-sm">
-              {account?.positions.map((p) => (
-                <li
-                  key={p.symbol}
-                  className={`rounded-lg border p-2 transition-colors ${
-                    chartSymbol === p.symbol
-                      ? "border-riskBlue/60 bg-riskBlue/10"
-                      : "border-line"
-                  }`}
-                >
-                  <div className="flex items-start gap-2">
-                    <button
-                      type="button"
-                      className="min-w-0 flex-1 text-left hover:opacity-90"
-                      title="Voir sur le graphique"
-                      onClick={() => void changeChartSymbol(p.symbol)}
-                    >
-                      <div className="flex justify-between font-medium">
-                        <span>{p.symbol}</span>
-                        <span className={pnlClass(p.unrealized_pnl)}>{money(p.unrealized_pnl)}</span>
-                      </div>
-                      <p className="text-muted">
-                        qté {p.qty.toFixed(6)} · entrée {money(p.avg_entry)} · cours {money(p.mark_price)}
-                      </p>
-                    </button>
-                    <button
-                      type="button"
-                      className="shrink-0 rounded-md border border-loss/40 px-2.5 py-1.5 text-xs font-semibold text-loss hover:bg-loss/10 disabled:opacity-50"
-                      disabled={busy}
-                      title={`Vendre toute la position ${p.symbol}`}
-                      onClick={() => sellPosition(p.symbol)}
-                    >
-                      {actionLabelBusy(`close-${p.symbol}`, "Vendre")}
-                    </button>
-                  </div>
-                </li>
-              ))}
-            </ul>
-          )}
+          <p className="mb-3 text-xs text-muted">
+            Vert = gagnante · rouge = perdante · mini-courbe = évolution du % depuis l’ouverture
+            de cette session UI
+          </p>
+          <PositionsPanel
+            positions={account?.positions || []}
+            chartSymbol={chartSymbol}
+            busy={busy}
+            onPick={(sym) => void changeChartSymbol(sym)}
+            onSell={sellPosition}
+            sellLabel={(sym) => actionLabelBusy(`close-${sym}`, "Vendre")}
+          />
         </section>
 
         <section className="card md:col-span-4">
