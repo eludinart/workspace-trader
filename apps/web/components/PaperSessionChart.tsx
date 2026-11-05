@@ -311,8 +311,6 @@ export function PaperSessionChart({
       ddPts,
       gridY,
       ddTicks,
-      timeTicks: formatAxisTime(domain.start, span),
-      timeEnd: formatAxisTime(domain.end, span),
       timeTicks,
       coverageNote,
       zeroY: yMoney(0),
