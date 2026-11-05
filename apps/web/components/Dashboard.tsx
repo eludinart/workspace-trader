@@ -11,6 +11,13 @@ import { NewsPanel } from "@/components/NewsPanel";
 import { PaperSessionChart } from "@/components/PaperSessionChart";
 import { SignalText } from "@/components/SignalText";
 import { Candle, PriceChart } from "@/components/PriceChart";
+import {
+  ACTION_LABELS,
+  PendingBanner,
+  ToastStack,
+  type ToastItem,
+  type ToastTone,
+} from "@/components/ActionFeedback";
 import { SystemStatus } from "@/components/SystemStatus";
 import { UniversePanel } from "@/components/UniversePanel";
 import {
@@ -94,7 +101,9 @@ export function Dashboard() {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [pendingAction, setPendingAction] = useState<string | null>(null);
+  const [toasts, setToasts] = useState<ToastItem[]>([]);
   const actionLockRef = useRef(false);
+  const toastTimersRef = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
   const [live, setLive] = useState(false);
   const [streamPhase, setStreamPhase] = useState<"connecting" | "live" | "reconnecting">("connecting");
   const [btStart, setBtStart] = useState(() => {
@@ -236,6 +245,13 @@ export function Dashboard() {
   useEffect(() => {
     const stored = loadChartTimeframeSec();
     if (stored != null) setCandleGranularitySec(stored);
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      for (const timer of Object.values(toastTimersRef.current)) clearTimeout(timer);
+      toastTimersRef.current = {};
+    };
   }, []);
 
   useEffect(() => {
@@ -475,12 +491,41 @@ export function Dashboard() {
     };
   }, [fetchCandles]);
 
+  function dismissToast(id: string) {
+    const timer = toastTimersRef.current[id];
+    if (timer) {
+      clearTimeout(timer);
+      delete toastTimersRef.current[id];
+    }
+    setToasts((prev) => prev.filter((t) => t.id !== id));
+  }
+
+  function pushToast(
+    message: string,
+    tone: ToastTone = "info",
+    extra?: { undoLabel?: string; onUndo?: () => void; ttlMs?: number },
+  ) {
+    const id = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const item: ToastItem = {
+      id,
+      message,
+      tone,
+      undoLabel: extra?.undoLabel,
+      onUndo: extra?.onUndo,
+    };
+    setToasts((prev) => [...prev.slice(-3), item]);
+    const ttl = extra?.ttlMs ?? (extra?.onUndo ? 6_000 : 3_500);
+    toastTimersRef.current[id] = setTimeout(() => dismissToast(id), ttl);
+  }
+
   async function run(
     actionId: string,
     action: () => Promise<unknown>,
     opts?: {
       confirm?: string;
       optimistic?: () => void;
+      successMessage?: string;
+      undo?: { label: string; run: () => Promise<void> | void };
     },
   ) {
     if (actionLockRef.current) return;
@@ -490,13 +535,35 @@ export function Dashboard() {
     setPendingAction(actionId);
     setError(null);
     opts?.optimistic?.();
+    const nice = ACTION_LABELS[actionId] || actionId;
     try {
       await action();
       // Fast path after click: skip candles/backtest so the UI unlocks sooner.
       await refreshCore();
       setError(null);
+      if (opts?.undo) {
+        pushToast(opts.successMessage || `${nice} — fait.`, "ok", {
+          undoLabel: opts.undo.label,
+          onUndo: () => {
+            void (async () => {
+              try {
+                await opts.undo!.run();
+                await refreshCore();
+                pushToast("Annulé.", "info");
+              } catch (e) {
+                pushToast(e instanceof Error ? e.message : "Annulation échouée", "error");
+              }
+            })();
+          },
+          ttlMs: 6_000,
+        });
+      } else {
+        pushToast(opts?.successMessage || `${nice} — fait.`, "ok");
+      }
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Action échouée");
+      const msg = e instanceof Error ? e.message : "Action échouée";
+      setError(msg);
+      pushToast(msg, "error");
       try {
         await refreshCore();
       } catch {
@@ -571,7 +638,9 @@ export function Dashboard() {
       if (!Number.isNaN(n)) body[key] = n;
     }
 
-    await run("save-params", () => api.putParams(body));
+    await run("save-params", () => api.putParams(body), {
+      successMessage: "Paramètres enregistrés.",
+    });
   }
 
   async function saveAlerts(e: FormEvent<HTMLFormElement>) {
@@ -587,31 +656,26 @@ export function Dashboard() {
       pnl_alert_threshold: Number(fd.get("pnl_alert_threshold") || 100),
       strong_signal_threshold: Number(fd.get("strong_signal_threshold") || 0.75),
     };
-    await run("save-alerts", () => api.putAlerts(body));
+    await run("save-alerts", () => api.putAlerts(body), {
+      successMessage: "Alertes enregistrées.",
+    });
   }
 
   async function runBacktest(e: FormEvent) {
     e.preventDefault();
-    if (actionLockRef.current) return;
-    actionLockRef.current = true;
-    setBusy(true);
-    setPendingAction("backtest");
-    try {
-      const res = await api.backtest({
-        symbol: String(params.symbol || "BTC-USD"),
-        start: new Date(`${btStart}T00:00:00Z`).toISOString(),
-        end: new Date(`${btEnd}T23:59:59Z`).toISOString(),
-        initial_balance: Number(account?.initial_balance || params.initial_balance || 800),
-      });
-      setBacktest(res);
-      setError(null);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Backtest échoué");
-    } finally {
-      actionLockRef.current = false;
-      setPendingAction(null);
-      setBusy(false);
-    }
+    await run(
+      "backtest",
+      async () => {
+        const res = await api.backtest({
+          symbol: String(params.symbol || "BTC-USD"),
+          start: new Date(`${btStart}T00:00:00Z`).toISOString(),
+          end: new Date(`${btEnd}T23:59:59Z`).toISOString(),
+          initial_balance: Number(account?.initial_balance || params.initial_balance || 800),
+        });
+        setBacktest(res);
+      },
+      { successMessage: "Backtest terminé." },
+    );
   }
 
   const risk = riskTone(account?.risk_score ?? 0);
@@ -625,8 +689,14 @@ export function Dashboard() {
       ? account.auto_trade
       : Boolean(params.auto_trade);
 
+  const pendingBannerLabel = pendingAction
+    ? ACTION_LABELS[pendingAction] || pendingAction
+    : null;
+
   return (
-    <div className="mx-auto max-w-7xl px-3 py-4 md:px-6 md:py-6">
+    <div className={`mx-auto max-w-7xl px-3 py-4 md:px-6 md:py-6 ${busy ? "pt-12" : ""}`}>
+      <PendingBanner visible={busy} label={pendingBannerLabel} />
+      <ToastStack toasts={toasts} onDismiss={dismissToast} />
       <header className="mb-4 flex flex-wrap items-start justify-between gap-3">
         <div>
           <p className="text-xs uppercase tracking-[0.2em] text-muted">Trading simulé</p>
@@ -798,7 +868,9 @@ export function Dashboard() {
             className="btn-primary"
             disabled={busy}
             title="Force une décision IA immédiate (un tick paper)."
-            onClick={() => void run("tick", () => api.tick())}
+            onClick={() =>
+              void run("tick", () => api.tick(), { successMessage: "Décision IA lancée." })
+            }
           >
             {actionLabelBusy("tick", "Décider")}
           </button>
@@ -812,6 +884,7 @@ export function Dashboard() {
             }
             onClick={() =>
               void run("loop", () => (botRunning ? api.stop() : api.start()), {
+                successMessage: botRunning ? "Boucle arrêtée." : "Boucle démarrée.",
                 optimistic: () =>
                   setAccount((prev) =>
                     prev ? { ...prev, bot_running: !botRunning } : prev,
@@ -827,6 +900,8 @@ export function Dashboard() {
             title="Kill switch : bloque les nouveaux ordres paper."
             onClick={() =>
               void run("kill", () => api.kill(), {
+                confirm: "Activer l’arrêt d’urgence ? Aucun nouvel ordre paper ne sera placé.",
+                successMessage: "Arrêt d’urgence actif.",
                 optimistic: () =>
                   setAccount((prev) =>
                     prev ? { ...prev, killed: true, auto_trade: false } : prev,
@@ -842,6 +917,7 @@ export function Dashboard() {
             title="Reprend après un arrêt ou une urgence."
             onClick={() =>
               void run("resume", () => api.resume(), {
+                successMessage: "Trading repris.",
                 optimistic: () =>
                   setAccount((prev) =>
                     prev ? { ...prev, killed: false, kill_reason: null, bot_running: true } : prev,
@@ -956,112 +1032,135 @@ export function Dashboard() {
             value={`${money(account?.drawdown_pct ?? 0, 1)} %`}
             hint="Baisse maximale depuis le plus haut du compte (drawdown)."
           />
-          <div
-            className={`grid grid-cols-2 gap-2 pt-2 ${busy ? "pointer-events-none opacity-80" : ""}`}
-            aria-busy={busy}
-          >
-            {busy && pendingAction ? (
-              <p className="col-span-2 text-center text-xs text-muted">
-                Action en cours… un seul clic à la fois.
-              </p>
-            ) : null}
-            <button
-              className="btn-primary"
-              disabled={busy}
-              title="Force une décision IA immédiate (un tick paper)."
-              onClick={() => void run("tick", () => api.tick())}
-            >
-              {actionLabelBusy("tick", "Décider (IA)")}
-            </button>
-            <button
-              className={botRunning ? "btn-ghost" : "btn-primary"}
-              disabled={busy}
-              title={
-                botRunning
-                  ? "Arrête la boucle de décisions ; positions et cash conservés."
-                  : "Démarre la boucle automatique de décisions paper."
-              }
-              onClick={() =>
-                void run("loop", () => (botRunning ? api.stop() : api.start()), {
-                  optimistic: () =>
-                    setAccount((prev) =>
-                      prev ? { ...prev, bot_running: !botRunning } : prev,
-                    ),
-                })
-              }
-            >
-              {actionLabelBusy("loop", botRunning ? "Arrêter" : "Démarrer")}
-            </button>
-            <button
-              className="btn-danger"
-              disabled={busy}
-              title="Kill switch : bloque les nouveaux ordres paper."
-              onClick={() =>
-                void run("kill", () => api.kill(), {
-                  optimistic: () =>
-                    setAccount((prev) =>
-                      prev ? { ...prev, killed: true, auto_trade: false } : prev,
-                    ),
-                })
-              }
-            >
-              {actionLabelBusy("kill", "Arrêt d'urgence")}
-            </button>
-            <button
-              className="btn-ok"
-              disabled={busy}
-              title="Reprend après un arrêt ou une urgence."
-              onClick={() =>
-                void run("resume", () => api.resume(), {
-                  optimistic: () =>
-                    setAccount((prev) =>
-                      prev
-                        ? { ...prev, killed: false, kill_reason: null, bot_running: true }
-                        : prev,
-                    ),
-                })
-              }
-            >
-              {actionLabelBusy("resume", "Reprendre")}
-            </button>
-            <button
-              className={autoTradeOn ? "btn-ghost" : "btn-primary"}
-              disabled={busy}
-              title={
-                autoTradeOn
-                  ? "Désactive les ordres automatiques (pas de nouveaux trades)."
-                  : "Autorise les ordres paper automatiques."
-              }
-              onClick={() =>
-                void run(
-                  "auto",
-                  () => api.putParams({ auto_trade: !autoTradeOn }),
-                  {
-                    optimistic: () => {
-                      setAccount((prev) =>
-                        prev ? { ...prev, auto_trade: !autoTradeOn } : prev,
-                      );
-                      setParams((prev) => ({ ...prev, auto_trade: !autoTradeOn }));
-                    },
-                  },
-                )
-              }
-            >
-              {actionLabelBusy("auto", autoTradeOn ? "Couper auto" : "Activer auto")}
-            </button>
-            <button
-              className="btn-ghost"
-              disabled={busy}
-              title="Remet cash, positions, trades et historique chart au solde initial."
-              onClick={() =>
-                void run("reset", () => api.reset(), {
-                  confirm:
-                    "Réinitialiser le compte paper ? Cash, positions et historique seront remis au solde initial.",
-                })
-              }
-            >
-              {actionLabelBusy("reset", "Réinitialiser")}
-            </button>
+          <div className={`space-y-3 pt-2 ${busy ? "opacity-80" : ""}`} aria-busy={busy}>
+            <div>
+              <p className="label mb-1.5">Pilotage</p>
+              <div className={`grid grid-cols-2 gap-2 ${busy ? "pointer-events-none" : ""}`}>
+                <button
+                  className="btn-primary"
+                  disabled={busy}
+                  title="Force une décision IA immédiate (un tick paper)."
+                  onClick={() =>
+                    void run("tick", () => api.tick(), {
+                      successMessage: "Décision IA lancée.",
+                    })
+                  }
+                >
+                  {actionLabelBusy("tick", "Décider (IA)")}
+                </button>
+                <button
+                  className={botRunning ? "btn-ghost" : "btn-primary"}
+                  disabled={busy}
+                  title={
+                    botRunning
+                      ? "Arrête la boucle de décisions ; positions et cash conservés."
+                      : "Démarre la boucle automatique de décisions paper."
+                  }
+                  onClick={() =>
+                    void run("loop", () => (botRunning ? api.stop() : api.start()), {
+                      successMessage: botRunning ? "Boucle arrêtée." : "Boucle démarrée.",
+                      optimistic: () =>
+                        setAccount((prev) =>
+                          prev ? { ...prev, bot_running: !botRunning } : prev,
+                        ),
+                    })
+                  }
+                >
+                  {actionLabelBusy("loop", botRunning ? "Arrêter" : "Démarrer")}
+                </button>
+              </div>
+            </div>
+
+            <div>
+              <p className="label mb-1.5">Sécurité</p>
+              <div className={`grid grid-cols-2 gap-2 ${busy ? "pointer-events-none" : ""}`}>
+                <button
+                  className="btn-danger"
+                  disabled={busy}
+                  title="Kill switch : bloque les nouveaux ordres paper."
+                  onClick={() =>
+                    void run("kill", () => api.kill(), {
+                      confirm:
+                        "Activer l’arrêt d’urgence ? Aucun nouvel ordre paper ne sera placé.",
+                      successMessage: "Arrêt d’urgence actif.",
+                      optimistic: () =>
+                        setAccount((prev) =>
+                          prev ? { ...prev, killed: true, auto_trade: false } : prev,
+                        ),
+                    })
+                  }
+                >
+                  {actionLabelBusy("kill", "Arrêt d’urgence")}
+                </button>
+                <button
+                  className="btn-ok"
+                  disabled={busy}
+                  title="Reprend après un arrêt ou une urgence."
+                  onClick={() =>
+                    void run("resume", () => api.resume(), {
+                      successMessage: "Trading repris.",
+                      optimistic: () =>
+                        setAccount((prev) =>
+                          prev
+                            ? { ...prev, killed: false, kill_reason: null, bot_running: true }
+                            : prev,
+                        ),
+                    })
+                  }
+                >
+                  {actionLabelBusy("resume", "Reprendre")}
+                </button>
+              </div>
+            </div>
+
+            <div>
+              <p className="label mb-1.5">Compte</p>
+              <div className={`grid grid-cols-2 gap-2 ${busy ? "pointer-events-none" : ""}`}>
+                <button
+                  className={autoTradeOn ? "btn-ghost" : "btn-primary"}
+                  disabled={busy}
+                  title={
+                    autoTradeOn
+                      ? "Désactive les ordres automatiques (pas de nouveaux trades)."
+                      : "Autorise les ordres paper automatiques."
+                  }
+                  onClick={() => {
+                    const next = !autoTradeOn;
+                    void run("auto", () => api.putParams({ auto_trade: next }), {
+                      successMessage: next ? "Ordres auto activés." : "Ordres auto coupés.",
+                      optimistic: () => {
+                        setAccount((prev) => (prev ? { ...prev, auto_trade: next } : prev));
+                        setParams((prev) => ({ ...prev, auto_trade: next }));
+                      },
+                      undo: {
+                        label: "Annuler",
+                        run: async () => {
+                          await api.putParams({ auto_trade: !next });
+                          setAccount((prev) => (prev ? { ...prev, auto_trade: !next } : prev));
+                          setParams((prev) => ({ ...prev, auto_trade: !next }));
+                        },
+                      },
+                    });
+                  }}
+                >
+                  {actionLabelBusy("auto", autoTradeOn ? "Couper auto" : "Activer auto")}
+                </button>
+                <button
+                  className="btn-ghost"
+                  disabled={busy}
+                  title="Remet cash, positions, trades et historique chart au solde initial."
+                  onClick={() =>
+                    void run("reset", () => api.reset(), {
+                      confirm:
+                        "Réinitialiser le compte paper ? Cash, positions et historique seront remis au solde initial. Cette action est irréversible.",
+                      successMessage: "Compte paper réinitialisé.",
+                    })
+                  }
+                >
+                  {actionLabelBusy("reset", "Réinitialiser")}
+                </button>
+              </div>
+            </div>
           </div>
         </section>
 
@@ -1188,9 +1287,20 @@ export function Dashboard() {
                   }
                   disabled={busy}
                   onClick={() =>
-                    void run(`style-${style}`, async () => {
-                      await api.putParams({ trading_style: style });
-                    })
+                    void run(
+                      `style-${style}`,
+                      async () => {
+                        await api.putParams({ trading_style: style });
+                      },
+                      {
+                        successMessage:
+                          style === "prudent"
+                            ? "Style prudent."
+                            : style === "agressif"
+                              ? "Style agressif."
+                              : "Style intermédiaire.",
+                      },
+                    )
                   }
                 >
                   {pendingAction === `style-${style}`
