@@ -1302,15 +1302,22 @@ class TradingRuntime:
             prices.setdefault(sym, pos.avg_entry)
         return prices
 
+    def _bot_running_for_ui(self) -> bool:
+        """API process has no local loops; UI must follow trader lease when Store is wired."""
+        if self.running:
+            return True
+        if self.store is None:
+            return False
+        try:
+            held = bool(read_lease().get("held"))
+            self._db_ok = True
+            return held
+        except Exception:  # noqa: BLE001
+            self._db_ok = False
+            return False
+
     def status(self) -> dict[str, Any]:
-        bot_running = self.running
-        if self.lease is None and self.store is not None:
-            try:
-                bot_running = bool(read_lease().get("held"))
-                self._db_ok = True
-            except Exception:  # noqa: BLE001
-                self._db_ok = False
-                bot_running = False
+        bot_running = self._bot_running_for_ui()
         return {
             "bot_running": bot_running,
             "executor": (
@@ -1510,7 +1517,7 @@ class TradingRuntime:
             "active_symbol": self.active_symbol,
             "prices": prices,
             "last_price": self.last_price,
-            "bot_running": self.running,
+            "bot_running": self._bot_running_for_ui(),
             "auto_trade": self.params.auto_trade,
             "killed": self.killed,
             "kill_reason": self.kill_reason,
