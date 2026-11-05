@@ -6,15 +6,25 @@ function engineBase() {
   return process.env.ENGINE_URL || "http://127.0.0.1:8100";
 }
 
+/** Incoming headers forwarded to the engine (incl. /control/*). */
+const FORWARD_REQUEST_HEADERS = ["authorization", "accept", "content-type"] as const;
+
+function upstreamRequestHeaders(req: NextRequest): Headers {
+  const headers = new Headers();
+  for (const name of FORWARD_REQUEST_HEADERS) {
+    const value = req.headers.get(name);
+    if (value) headers.set(name, value);
+  }
+  return headers;
+}
+
 async function proxy(req: NextRequest, ctx: { params: Promise<{ path: string[] }> }) {
   const { path } = await ctx.params;
   const targetPath = path.join("/");
   const url = new URL(req.url);
   const target = `${engineBase()}/${targetPath}${url.search}`;
 
-  const headers = new Headers();
-  const contentType = req.headers.get("content-type");
-  if (contentType) headers.set("content-type", contentType);
+  const headers = upstreamRequestHeaders(req);
 
   const init: RequestInit = {
     method: req.method,
