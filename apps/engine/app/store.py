@@ -220,6 +220,61 @@ class Store:
                 conn.rollback()
                 raise
 
+    def request_reset(self, initial_balance: float | None) -> None:
+        """Ask the lease owner to reset the paper book. Does not touch positions or trades."""
+        with get_conn() as conn:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO runtime_meta (id, reset_requested, reset_balance, updated_at)
+                        VALUES (%s, %s, %s, CURRENT_TIMESTAMP)
+                        ON CONFLICT (id) DO UPDATE SET
+                          reset_requested = EXCLUDED.reset_requested,
+                          reset_balance = EXCLUDED.reset_balance,
+                          updated_at = CURRENT_TIMESTAMP
+                        """,
+                        (_SINGLETON_ID, True, initial_balance),
+                    )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+    def peek_reset_request(self) -> tuple[bool, float | None]:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT reset_requested, reset_balance
+                    FROM runtime_meta WHERE id = %s
+                    """,
+                    (_SINGLETON_ID,),
+                )
+                row = cur.fetchone()
+        if row is None:
+            return False, None
+        requested, balance = row
+        parsed = float(balance) if balance is not None else None
+        return bool(requested), parsed
+
+    def clear_reset_request(self) -> None:
+        with get_conn() as conn:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        UPDATE runtime_meta
+                        SET reset_requested=%s, reset_balance=NULL, updated_at=CURRENT_TIMESTAMP
+                        WHERE id=%s
+                        """,
+                        (False, _SINGLETON_ID),
+                    )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
     def set_kill(self, killed: bool, kill_reason: str | None) -> bool:
         """Update kill flags only. Returns False when the account row does not exist."""
         with get_conn() as conn:
@@ -378,6 +433,7 @@ class Store:
 
     def _upsert_runtime_meta(self, cur, runtime: TradingRuntime) -> None:
         last_buy = {k: v.isoformat() for k, v in runtime._last_buy_at.items()}
+        # Omit reset_requested / reset_balance so a tick cannot clear an API reset.
         cur.execute(
             """
             INSERT INTO runtime_meta (id, last_buy_at, signal_history, updated_at)

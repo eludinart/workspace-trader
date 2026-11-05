@@ -80,6 +80,7 @@ async def main() -> None:
     except LeaseLost:
         logger.error("lease lost before loops started")
     finally:
+        # Join the in-flight tick before release so its persist still owns the lease.
         await runtime.stop()
         await runtime.shutdown_streams()
         await runtime.stop_heartbeat()

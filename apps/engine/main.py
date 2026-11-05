@@ -468,6 +468,7 @@ def post_backtest(body: BacktestBody) -> dict[str, Any]:
 
 @app.post("/account/reset")
 def reset_account(body: ResetBody | None = None) -> dict[str, Any]:
+    """Accept a reset. The API flags it; the trader applies it under the lease."""
     bal = body.initial_balance if body else None
     return runtime.reset_account(bal)
 

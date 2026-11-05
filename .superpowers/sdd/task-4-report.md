@@ -50,3 +50,23 @@ Docker is not on PATH here, so `docker compose config` and a live "one lease own
 - [x] Compose `trader` service + `DATABASE_URL`
 - [ ] Local compose up / single lease owner (docker unavailable)
 - [x] Commit message per brief
+
+## Follow-up — review findings 1 and 2
+
+### Reset (finding 1)
+`POST /account/reset` on the API does not call `wallet.reset` or `save_runtime`. It upserts `runtime_meta.reset_requested` and optional `reset_balance` (`Store.request_reset`) and returns the current account with `reset_accepted: true` and `reset_requested: true` (HTTP 200 so the dashboard refresh still works). Only the lease owner applies the flag: `TradingRuntime._apply_pending_reset` on start and between ticks runs the wallet reset, `save_runtime`, then `clear_reset_request`. `save_runtime` does not touch those columns, so an in-flight tick can write the pre-reset book back and the next loop still applies the reset. A process with no store (legacy JSON) still resets locally. A store-backed runtime whose lease check fails also only sets the flag.
+
+Migration: `apps/engine/app/migrations/002_reset_requested.sql`.
+
+### Shutdown (finding 2)
+`stop()` no longer cancels the loop task. Cancelling it does not join `asyncio.to_thread`, and the lock drops while that thread can still persist. `stop()` sets `running` false and awaits the loop task so the in-flight tick finishes first. `trader_main` still calls `stop()` before `lease.release()`. After release, `_persist_state` raises `LeaseLost` when `lease` is set and `is_owner()` is false, so a late writer cannot replace positions or trades. The loop may spend up to one second in its sleep chunk after the tick before `stop()` returns; that wait is still before release.
+
+### Tests
+```text
+cd apps/engine
+python -m pytest tests/test_trader_split.py tests/test_lease.py tests/test_store_roundtrip.py -q
+→ 15 passed
+```
+Added `test_api_reset_flags_book_until_trader_applies`, `test_stop_waits_for_inflight_tick`, and `test_persist_after_release_does_not_save`.
+
+Concern 2 above is closed for reset. Kill/resume still use `set_kill` and do not rewrite positions when the account row exists.

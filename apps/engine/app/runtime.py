@@ -181,6 +181,14 @@ class TradingRuntime:
         }
 
     def _persist_state(self) -> None:
+        if self.lease is not None:
+            try:
+                owned = self.lease.is_owner()
+            except Exception as exc:  # noqa: BLE001
+                self._db_ok = False
+                raise LeaseLost("persist refused: lease check failed") from exc
+            if not owned:
+                raise LeaseLost("persist refused: lease not held")
         payload = self._state_payload()
         if self.store is not None:
             try:
@@ -278,6 +286,7 @@ class TradingRuntime:
             return
         if not self._confirm_lease(respect_release=True):
             raise LeaseLost("cannot start trading loops without a live lease")
+        await asyncio.to_thread(self._apply_pending_reset)
         self.running = True
         self.stream_alive = True
         self._heartbeat_alive = True
@@ -367,14 +376,23 @@ class TradingRuntime:
         return snap
 
     async def stop(self) -> None:
+        """Stop after the in-flight tick persists. Do not cancel that tick.
+
+        ``asyncio.to_thread`` keeps running if the loop task is cancelled, and
+        the lock is released while the thread can still call ``_persist_state``.
+        Callers must release the lease only after this returns.
+        """
         self.running = False
-        if self._task:
-            self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
-            self._task = None
+        task = self._task
+        if task is None:
+            return
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.exception("trade loop failed while stopping")
+        self._task = None
 
     async def shutdown_streams(self) -> None:
         self.stream_alive = False
@@ -573,6 +591,13 @@ class TradingRuntime:
                 except Exception as exc:  # noqa: BLE001
                     self.last_error = f"store reload failed: {exc}"
                     logger.exception("store reload failed; fail-closed")
+                    self.running = False
+                    break
+                try:
+                    await asyncio.to_thread(self._apply_pending_reset)
+                except (LeaseLost, PersistenceError) as exc:
+                    self.last_error = str(exc)
+                    logger.error("fail-closed: %s", exc)
                     self.running = False
                     break
                 try:
@@ -1202,7 +1227,18 @@ class TradingRuntime:
         self._save_params()
         return updated
 
-    def reset_account(self, initial_balance: float | None = None) -> dict[str, Any]:
+    def _apply_pending_reset(self) -> None:
+        """Apply an API reset flag. Only the live lease owner writes the book."""
+        if self.store is None or self.lease is None:
+            return
+        requested, balance = self.store.peek_reset_request()
+        if not requested:
+            return
+        if not self._confirm_lease(respect_release=False):
+            raise LeaseLost("reset refused: lease not held")
+        self._reset_owned(balance)
+
+    def _reset_owned(self, initial_balance: float | None) -> dict[str, Any]:
         bal = initial_balance if initial_balance is not None else self.params.initial_balance
         self.params.initial_balance = bal
         self.wallet.reset(bal)
@@ -1230,7 +1266,28 @@ class TradingRuntime:
         clear_state()
         self._save_params()
         self._persist_state()
+        if self.store is not None:
+            self.store.clear_reset_request()
         return self.account_state()
+
+    def reset_account(self, initial_balance: float | None = None) -> dict[str, Any]:
+        """Reset the paper book only when this process holds the lease.
+
+        The API process has a store and no lease. It records ``reset_requested``
+        and leaves positions and trades unchanged. The trader applies the flag
+        between ticks, then ``save_runtime``. A process with no store (legacy
+        JSON) still resets locally.
+        """
+        leased = self.store is not None and self.lease is not None and self._confirm_lease(
+            respect_release=False
+        )
+        if self.store is not None and not leased:
+            self.store.request_reset(initial_balance)
+            state = self.account_state()
+            state["reset_accepted"] = True
+            state["reset_requested"] = True
+            return state
+        return self._reset_owned(initial_balance)
 
     def prices_map(self) -> dict[str, float]:
         prices = dict(self.prices)

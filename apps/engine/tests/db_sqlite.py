@@ -87,6 +87,8 @@ CREATE TABLE IF NOT EXISTS runtime_meta (
   last_buy_at TEXT NOT NULL DEFAULT '{}',
   signal_history TEXT NOT NULL DEFAULT '[]',
   migrated_at TEXT,
+  reset_requested INTEGER NOT NULL DEFAULT 0,
+  reset_balance REAL,
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 INSERT OR IGNORE INTO runtime_meta (id) VALUES (1);
