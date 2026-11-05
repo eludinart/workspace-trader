@@ -184,7 +184,8 @@ class _SqliteCursor:
 
 class _SqliteConn:
     def __init__(self) -> None:
-        self._conn = sqlite3.connect(":memory:")
+        # TestClient handles requests off the thread that opened this connection.
+        self._conn = sqlite3.connect(":memory:", check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
 
     def cursor(self) -> _SqliteCursor:

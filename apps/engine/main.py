@@ -10,13 +10,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
+from app import store as store_module
 from app.backtest import run_backtest
 from app.config import BotParams
+from app.control_auth import mask_secret_values, require_control_read, require_control_write
 from app.db import get_conn
 from app.lease import read_lease
 from app.migrate import run_migrations
@@ -504,6 +507,197 @@ async def bot_tick() -> dict[str, Any]:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+def _control_read_failed(exc: Exception) -> HTTPException:
+    logger.exception("control read failed")
+    return HTTPException(status_code=503, detail="control read failed")
+
+
+def _control_write_failed(exc: Exception) -> HTTPException:
+    logger.exception("control write failed")
+    return HTTPException(status_code=503, detail="control write failed")
+
+
+def _fetch_account() -> tuple[Any, ...] | None:
+    """Return ``(mode, cash, killed, kill_reason)`` or None when the row is missing."""
+    try:
+        with store_module.get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT mode, cash, killed, kill_reason
+                    FROM account WHERE id = %s
+                    """,
+                    (1,),
+                )
+                return cur.fetchone()
+    except Exception as exc:  # noqa: BLE001
+        raise _control_read_failed(exc) from exc
+
+
+def _assert_paper_mode() -> None:
+    row = _fetch_account()
+    if row is None:
+        return
+    if str(row[0]) != "paper":
+        raise HTTPException(status_code=403, detail="paper mode required")
+
+
+def _audit(actor: str, action: str, payload: dict[str, Any]) -> None:
+    if runtime.store is None:
+        raise HTTPException(status_code=503, detail="control write failed")
+    try:
+        runtime.store.audit(actor, action, payload)
+    except Exception as exc:  # noqa: BLE001
+        raise _control_write_failed(exc) from exc
+
+
+def _public_params() -> dict[str, Any]:
+    return mask_secret_values(runtime.params.model_dump(mode="json"))
+
+
+@app.get("/control/status")
+def control_status(_actor: str = Depends(require_control_read)) -> dict[str, Any]:
+    """Paper book, kill flag, and lease. Reads Postgres, not the API process cache."""
+    try:
+        if runtime.store is not None:
+            runtime._reload_params_only()
+        row = _fetch_account()
+        with store_module.get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT symbol, qty, avg_entry FROM positions ORDER BY symbol"
+                )
+                pos_rows = cur.fetchall()
+        lease = read_lease()
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise _control_read_failed(exc) from exc
+
+    if row is None:
+        cash = float(runtime.params.initial_balance)
+        killed = False
+        kill_reason = None
+        pos_rows = []
+    else:
+        mode, cash, killed, kill_reason = row
+        if str(mode) != "paper":
+            raise HTTPException(status_code=403, detail="paper mode required")
+    positions = [
+        {"symbol": str(sym), "qty": float(qty), "avg_entry": float(avg)}
+        for sym, qty, avg in pos_rows
+    ]
+    return {
+        "mode": "paper",
+        "lease": {
+            "owner_id": lease.get("owner_id"),
+            "heartbeat_at": lease.get("heartbeat_at"),
+            "expires_at": lease.get("expires_at"),
+            "held": bool(lease.get("held")),
+            "release_requested": bool(lease.get("release_requested")),
+            "version": lease.get("version"),
+        },
+        "killed": bool(killed),
+        "kill_reason": kill_reason,
+        "cash": float(cash),
+        "positions": positions,
+    }
+
+
+@app.get("/control/params")
+def control_get_params(_actor: str = Depends(require_control_read)) -> dict[str, Any]:
+    _assert_paper_mode()
+    try:
+        if runtime.store is not None:
+            runtime._reload_params_only()
+    except Exception as exc:  # noqa: BLE001
+        raise _control_read_failed(exc) from exc
+    return _public_params()
+
+
+@app.put("/control/params")
+def control_put_params(
+    body: ParamsUpdate,
+    actor: str = Depends(require_control_write),
+) -> dict[str, Any]:
+    _assert_paper_mode()
+    try:
+        if runtime.store is not None:
+            runtime._reload_params_only()
+        before = runtime.params.model_dump(mode="json")
+        updated = runtime.update_params(body.model_dump(exclude_unset=True))
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail=jsonable_encoder(exc.errors())) from exc
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise _control_write_failed(exc) from exc
+    after = updated.model_dump(mode="json")
+    diff = {
+        key: {"from": before.get(key), "to": value}
+        for key, value in after.items()
+        if before.get(key) != value
+    }
+    _audit(actor, "params", {"diff": diff})
+    return mask_secret_values(after)
+
+
+@app.post("/control/kill")
+def control_kill(
+    body: KillBody | None = None,
+    actor: str = Depends(require_control_write),
+) -> dict[str, Any]:
+    _assert_paper_mode()
+    reason = body.reason if body else "manual"
+    try:
+        runtime.engage_kill_switch(reason)
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise _control_write_failed(exc) from exc
+    _audit(actor, "kill", {"reason": reason, "killed": True})
+    return {
+        "mode": "paper",
+        "killed": True,
+        "kill_reason": runtime.kill_reason,
+        "auto_trade": runtime.params.auto_trade,
+    }
+
+
+@app.post("/control/resume")
+def control_resume(actor: str = Depends(require_control_write)) -> dict[str, Any]:
+    _assert_paper_mode()
+    try:
+        runtime.resume_from_kill()
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise _control_write_failed(exc) from exc
+    _audit(actor, "resume", {"killed": False})
+    return {
+        "mode": "paper",
+        "killed": bool(runtime.killed),
+        "kill_reason": runtime.kill_reason,
+    }
+
+
+@app.post("/control/tick")
+async def control_tick(actor: str = Depends(require_control_write)) -> dict[str, Any]:
+    """Forced paper decision. The API process has no lease, so this stays fail-closed."""
+    _assert_paper_mode()
+    try:
+        result = await runtime.tick()
+    except LeaseLost as exc:
+        _audit(actor, "tick", {"accepted": False, "detail": "lease"})
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise _control_write_failed(exc) from exc
+    _audit(actor, "tick", {"accepted": True, "mode": "paper"})
+    return {"mode": "paper", "accepted": True, "result": result}
 
 
 @app.get("/stream")
