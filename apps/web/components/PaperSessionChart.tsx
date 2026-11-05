@@ -1,6 +1,13 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type PointerEvent as ReactPointerEvent,
+} from "react";
 import { api, money, pnlClass } from "@/lib/engine";
 
 export type PaperSample = {
@@ -32,6 +39,8 @@ type PaperSessionChartProps = {
   maxPoints?: number;
 };
 
+type SeriesKey = "equity" | "cash" | "pnl" | "positions" | "drawdown";
+
 const RANGE_OPTIONS: Array<{ id: PaperTimeRange; label: string; hint: string }> = [
   { id: "1h", label: "1h", hint: "Dernière heure" },
   { id: "6h", label: "6h", hint: "6 dernières heures" },
@@ -45,43 +54,51 @@ const RANGE_OPTIONS: Array<{ id: PaperTimeRange; label: string; hint: string }> 
 ];
 
 const VALID_RANGES = new Set<PaperTimeRange>(RANGE_OPTIONS.map((o) => o.id));
-
 const STORAGE_KEY = "wt.paperChartRange";
+const LAYERS_KEY = "wt.paperChartLayers";
 
-const W = 740;
-const H = 242;
-const PAD = { top: 16, right: 44, bottom: 36, left: 52 };
+const W = 900;
+const H = 320;
+const PAD = { top: 28, right: 56, bottom: 40, left: 64 };
 
 const COLORS = {
   equity: "#38bdf8",
-  cash: "#a78bfa",
+  cash: "#c4b5fd",
   pnl: "#34d399",
   pnlNeg: "#f87171",
   positions: "#fbbf24",
   drawdown: "#fb7185",
-  grid: "#1e293b",
+  grid: "rgba(148,163,184,0.12)",
   axis: "#64748b",
+  cross: "rgba(226,232,240,0.35)",
+  panel: "#0b1220",
 } as const;
 
-function linePath(points: Array<{ x: number; y: number }>): string {
-  if (!points.length) return "";
-  return points
-    .map((p, i) => `${i === 0 ? "M" : "L"}${p.x.toFixed(1)},${p.y.toFixed(1)}`)
-    .join(" ");
-}
-
-function fmtPct(v: number, digits = 2): string {
-  return `${v.toLocaleString("fr-FR", {
-    minimumFractionDigits: digits,
-    maximumFractionDigits: digits,
-  })} %`;
-}
+const DEFAULT_LAYERS: Record<SeriesKey, boolean> = {
+  equity: true,
+  cash: true,
+  pnl: false,
+  positions: false,
+  drawdown: true,
+};
 
 function loadRange(): PaperTimeRange {
   if (typeof window === "undefined") return "1h";
   const raw = window.localStorage.getItem(STORAGE_KEY);
   if (raw && VALID_RANGES.has(raw as PaperTimeRange)) return raw as PaperTimeRange;
   return "1h";
+}
+
+function loadLayers(): Record<SeriesKey, boolean> {
+  if (typeof window === "undefined") return { ...DEFAULT_LAYERS };
+  try {
+    const raw = window.localStorage.getItem(LAYERS_KEY);
+    if (!raw) return { ...DEFAULT_LAYERS };
+    const parsed = JSON.parse(raw) as Partial<Record<SeriesKey, boolean>>;
+    return { ...DEFAULT_LAYERS, ...parsed, equity: true };
+  } catch {
+    return { ...DEFAULT_LAYERS };
+  }
 }
 
 function rangeDeltaMs(range: PaperTimeRange): number | null {
@@ -101,36 +118,112 @@ function rangeCutoffMs(range: PaperTimeRange, sessionStartedAt: number | null): 
   return null;
 }
 
-/** Visible X domain = selected preset window (not just min/max of samples). */
-function rangeDomainMs(
+/** Fit the X domain to data when the selected window is mostly empty. */
+function visibleDomainMs(
   range: PaperTimeRange,
   sessionStartedAt: number | null,
   series: PaperSample[],
-): { start: number; end: number } {
+): { start: number; end: number; fitted: boolean } {
   const end = Date.now();
   const delta = rangeDeltaMs(range);
-  if (delta != null) return { start: end - delta, end };
-  if (range === "session") {
-    const start = sessionStartedAt ?? series[0]?.t ?? end - 3600_000;
-    return { start: Math.min(start, end - 60_000), end };
+  let windowStart: number;
+  if (delta != null) windowStart = end - delta;
+  else if (range === "session") {
+    windowStart = sessionStartedAt ?? series[0]?.t ?? end - 3600_000;
+  } else if (series.length) {
+    windowStart = series[0].t;
+  } else {
+    windowStart = end - 3600_000;
   }
-  if (series.length >= 1) {
-    const start = series[0].t;
-    return { start, end: Math.max(end, series[series.length - 1].t, start + 60_000) };
+
+  if (series.length === 0) {
+    return { start: windowStart, end, fitted: false };
   }
-  return { start: end - 3600_000, end };
+
+  const dataStart = series[0].t;
+  const dataEnd = Math.max(series[series.length - 1].t, end);
+  const dataSpan = Math.max(1, dataEnd - dataStart);
+  const windowSpan = Math.max(60_000, end - windowStart);
+
+  // Short history: zoom on the real samples so the curve fills the plot.
+  if (dataSpan < windowSpan * 0.4 || series.length < 8) {
+    const pad = Math.max(dataSpan * 0.12, 90_000);
+    return {
+      start: dataStart - pad,
+      end: Math.max(dataEnd + pad * 0.35, dataStart + pad * 2),
+      fitted: true,
+    };
+  }
+
+  return { start: windowStart, end, fitted: false };
 }
 
 function formatAxisTime(t: number, spanMs: number): string {
   const opts: Intl.DateTimeFormatOptions =
     spanMs >= 60 * 24 * 3600_000
-      ? { day: "2-digit", month: "short", year: "2-digit" }
+      ? { day: "2-digit", month: "short" }
       : spanMs >= 2 * 24 * 3600_000
         ? { day: "2-digit", month: "2-digit", hour: "2-digit" }
         : spanMs >= 3 * 3600_000
-          ? { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" }
+          ? { hour: "2-digit", minute: "2-digit" }
           : { hour: "2-digit", minute: "2-digit", second: "2-digit" };
   return new Date(t).toLocaleString("fr-FR", opts);
+}
+
+function fmtPct(v: number, digits = 2): string {
+  return `${v.toLocaleString("fr-FR", {
+    minimumFractionDigits: digits,
+    maximumFractionDigits: digits,
+  })} %`;
+}
+
+function niceMoneyTicks(min: number, max: number, count = 5): number[] {
+  const span = Math.max(1e-6, max - min);
+  const step = span / Math.max(1, count - 1);
+  const magnitude = 10 ** Math.floor(Math.log10(step));
+  const niceStep =
+    [1, 2, 2.5, 5, 10].map((m) => m * magnitude).find((s) => s >= step) ?? step;
+  const niceMin = Math.floor(min / niceStep) * niceStep;
+  const ticks: number[] = [];
+  for (let v = niceMin; v <= max + niceStep * 0.01 && ticks.length < count + 2; v += niceStep) {
+    ticks.push(v);
+  }
+  return ticks.length ? ticks : [min, max];
+}
+
+function linePath(points: Array<{ x: number; y: number }>): string {
+  if (!points.length) return "";
+  if (points.length === 1) return `M${points[0].x.toFixed(1)},${points[0].y.toFixed(1)}`;
+  let d = `M${points[0].x.toFixed(1)},${points[0].y.toFixed(1)}`;
+  for (let i = 1; i < points.length; i += 1) {
+    const p0 = points[i - 1];
+    const p1 = points[i];
+    const midX = (p0.x + p1.x) / 2;
+    d += ` C${midX.toFixed(1)},${p0.y.toFixed(1)} ${midX.toFixed(1)},${p1.y.toFixed(1)} ${p1.x.toFixed(1)},${p1.y.toFixed(1)}`;
+  }
+  return d;
+}
+
+function areaPath(points: Array<{ x: number; y: number }>, baselineY: number): string {
+  if (!points.length) return "";
+  const line = linePath(points);
+  const first = points[0];
+  const last = points[points.length - 1];
+  return `${line} L${last.x.toFixed(1)},${baselineY.toFixed(1)} L${first.x.toFixed(1)},${baselineY.toFixed(1)} Z`;
+}
+
+function nearestIndex(series: PaperSample[], t: number): number {
+  if (!series.length) return -1;
+  let best = 0;
+  let bestDist = Math.abs(series[0].t - t);
+  for (let i = 1; i < series.length; i += 1) {
+    const dist = Math.abs(series[i].t - t);
+    if (dist < bestDist) {
+      best = i;
+      bestDist = dist;
+    }
+  }
+  return best;
 }
 
 /** Live paper session chart with selectable time scale. */
@@ -140,23 +233,27 @@ export function PaperSessionChart({
   positions,
   pnl,
   live,
-  maxPoints = 400,
+  maxPoints = 480,
 }: PaperSessionChartProps) {
   const [range, setRange] = useState<PaperTimeRange>("1h");
+  const [layers, setLayers] = useState<Record<SeriesKey, boolean>>(DEFAULT_LAYERS);
   const [series, setSeries] = useState<PaperSample[]>([]);
   const [loadingHistory, setLoadingHistory] = useState(false);
   const [historyError, setHistoryError] = useState<string | null>(null);
   const [sessionStartedAt, setSessionStartedAt] = useState<number | null>(null);
+  const [hoverIdx, setHoverIdx] = useState<number | null>(null);
   const peakInView = useRef<number | null>(null);
   const lastPush = useRef(0);
   const lastSample = useRef<PaperSample | null>(null);
   const rangeRef = useRef(range);
   const liveRef = useRef({ equity, cash, positions, pnl });
+  const svgRef = useRef<SVGSVGElement | null>(null);
   rangeRef.current = range;
   liveRef.current = { equity, cash, positions, pnl };
 
   useEffect(() => {
     setRange(loadRange());
+    setLayers(loadLayers());
   }, []);
 
   const pushLiveSample = useCallback(
@@ -203,48 +300,59 @@ export function PaperSessionChart({
     [maxPoints, sessionStartedAt],
   );
 
-  const applyHistory = useCallback(async (nextRange: PaperTimeRange) => {
-    setLoadingHistory(true);
-    setHistoryError(null);
-    try {
-      const res = await api.equityHistory(nextRange);
-      if (res.session_started_at) {
-        const ts = Date.parse(res.session_started_at);
-        if (!Number.isNaN(ts)) setSessionStartedAt(ts);
+  const applyHistory = useCallback(
+    async (nextRange: PaperTimeRange) => {
+      setLoadingHistory(true);
+      setHistoryError(null);
+      try {
+        const res = await api.equityHistory(nextRange);
+        if (res.session_started_at) {
+          const ts = Date.parse(res.session_started_at);
+          if (!Number.isNaN(ts)) setSessionStartedAt(ts);
+        }
+        const mapped: PaperSample[] = (res.points || []).map((p) => ({
+          t: Date.parse(p.t) || Date.now(),
+          equity: Number(p.equity) || 0,
+          cash: Number(p.cash) || 0,
+          positions: Number(p.positions) || 0,
+          pnl: Number(p.pnl) || 0,
+          drawdownPct: Number(p.drawdown_pct) || 0,
+        }));
+        setSeries((prev) => {
+          const lastHistT = mapped.length ? mapped[mapped.length - 1].t : 0;
+          const liveTail = prev.filter((p) => p.t > lastHistT + 250);
+          const merged = [...mapped, ...liveTail];
+          const next = merged.length ? merged : prev;
+          peakInView.current = next.reduce(
+            (m, s) => Math.max(m, s.equity),
+            next[0]?.equity ?? liveRef.current.equity,
+          );
+          lastSample.current = next[next.length - 1] ?? null;
+          return next.length > maxPoints ? next.slice(-maxPoints) : next;
+        });
+      } catch (err) {
+        setHistoryError(err instanceof Error ? err.message : "Historique indisponible");
+      } finally {
+        setLoadingHistory(false);
       }
-      const mapped: PaperSample[] = (res.points || []).map((p) => ({
-        t: Date.parse(p.t) || Date.now(),
-        equity: Number(p.equity) || 0,
-        cash: Number(p.cash) || 0,
-        positions: Number(p.positions) || 0,
-        pnl: Number(p.pnl) || 0,
-        drawdownPct: Number(p.drawdown_pct) || 0,
-      }));
-      setSeries((prev) => {
-        const lastHistT = mapped.length ? mapped[mapped.length - 1].t : 0;
-        const liveTail = prev.filter((p) => p.t > lastHistT + 250);
-        const merged = [...mapped, ...liveTail];
-        const next = merged.length ? merged : prev;
-        peakInView.current = next.reduce(
-          (m, s) => Math.max(m, s.equity),
-          next[0]?.equity ?? liveRef.current.equity,
-        );
-        lastSample.current = next[next.length - 1] ?? null;
-        return next.length > maxPoints ? next.slice(-maxPoints) : next;
-      });
-    } catch (err) {
-      setHistoryError(err instanceof Error ? err.message : "Historique indisponible");
-    } finally {
-      setLoadingHistory(false);
-    }
-  }, [maxPoints]);
+    },
+    [maxPoints],
+  );
 
   useEffect(() => {
     void applyHistory(range);
   }, [range, applyHistory]);
 
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      void applyHistory(rangeRef.current);
+    }, 45_000);
+    return () => window.clearInterval(timer);
+  }, [applyHistory]);
+
   function changeRange(next: PaperTimeRange) {
     setRange(next);
+    setHoverIdx(null);
     try {
       window.localStorage.setItem(STORAGE_KEY, next);
     } catch {
@@ -252,7 +360,19 @@ export function PaperSessionChart({
     }
   }
 
-  // Keep drawing even when equity is flat: props alone do not re-fire.
+  function toggleLayer(key: SeriesKey) {
+    if (key === "equity") return;
+    setLayers((prev) => {
+      const next = { ...prev, [key]: !prev[key] };
+      try {
+        window.localStorage.setItem(LAYERS_KEY, JSON.stringify(next));
+      } catch {
+        /* ignore */
+      }
+      return next;
+    });
+  }
+
   useEffect(() => {
     pushLiveSample(true);
     const timer = window.setInterval(() => pushLiveSample(false), 2000);
@@ -266,157 +386,229 @@ export function PaperSessionChart({
   const latest = series[series.length - 1];
   const chartPnl = latest?.pnl ?? pnl;
   const drawdownPct = latest?.drawdownPct ?? 0;
+  const active = hoverIdx != null ? series[hoverIdx] : latest;
 
   const geometry = useMemo(() => {
-    const domain = rangeDomainMs(range, sessionStartedAt, series);
+    const domain = visibleDomainMs(range, sessionStartedAt, series);
     const span = Math.max(60_000, domain.end - domain.start);
     const innerW = W - PAD.left - PAD.right;
     const innerH = H - PAD.top - PAD.bottom;
-    const moneyVals =
-      series.length > 0
-        ? series.flatMap((s) => [s.equity, s.cash, s.pnl])
-        : [equity, cash, pnl];
+
+    // Left axis = portfolio dollars only (equity + optional cash). Never mix with ~0 P&L.
+    const moneyVals: number[] = [];
+    if (series.length) {
+      for (const s of series) {
+        moneyVals.push(s.equity);
+        if (layers.cash) moneyVals.push(s.cash);
+      }
+    } else {
+      moneyVals.push(equity, cash);
+    }
     let minM = Math.min(...moneyVals);
     let maxM = Math.max(...moneyVals);
-    if (maxM - minM < 1) {
-      minM -= 1;
-      maxM += 1;
+    const center = (minM + maxM) / 2;
+    if (maxM - minM < Math.max(2, Math.abs(center) * 0.004)) {
+      const padFlat = Math.max(2, Math.abs(center) * 0.01);
+      minM = center - padFlat;
+      maxM = center + padFlat;
+    } else {
+      const pad = (maxM - minM) * 0.12;
+      minM -= pad;
+      maxM += pad;
     }
-    const pad = (maxM - minM) * 0.08;
-    minM -= pad;
-    maxM += pad;
 
-    const maxPos = Math.max(1, ...series.map((s) => s.positions), positions);
-    const maxDd = Math.max(1, ...series.map((s) => s.drawdownPct), drawdownPct);
+    const maxPos = Math.max(1, ...series.map((s) => s.positions), positions, 1);
+    const maxDd = Math.max(
+      0.5,
+      ...series.map((s) => s.drawdownPct),
+      drawdownPct,
+      0.5,
+    );
+
+    // Optional P&L band uses its own normalized overlay near the bottom third when enabled.
+    const pnlVals = series.length ? series.map((s) => s.pnl) : [pnl];
+    let minPnl = Math.min(0, ...pnlVals);
+    let maxPnl = Math.max(0, ...pnlVals);
+    if (maxPnl - minPnl < 1) {
+      minPnl -= 1;
+      maxPnl += 1;
+    }
 
     const xAtTime = (t: number) => {
       const clamped = Math.min(domain.end, Math.max(domain.start, t));
       return PAD.left + ((clamped - domain.start) / span) * innerW;
     };
-    const yMoney = (v: number) =>
-      PAD.top + ((maxM - v) / (maxM - minM)) * innerH;
-    const yPos = (v: number) =>
-      PAD.top + ((maxPos - v) / maxPos) * innerH;
+    const yMoney = (v: number) => PAD.top + ((maxM - v) / (maxM - minM)) * innerH;
+    const yPos = (v: number) => PAD.top + ((maxPos - v) / maxPos) * innerH * 0.85 + innerH * 0.08;
     const yDd = (v: number) => PAD.top + (v / maxDd) * innerH;
+    const yPnl = (v: number) => {
+      const top = PAD.top + innerH * 0.55;
+      const h = innerH * 0.4;
+      return top + ((maxPnl - v) / (maxPnl - minPnl)) * h;
+    };
 
     const equityPts = series.map((s) => ({ x: xAtTime(s.t), y: yMoney(s.equity) }));
     const cashPts = series.map((s) => ({ x: xAtTime(s.t), y: yMoney(s.cash) }));
-    const pnlPts = series.map((s) => ({ x: xAtTime(s.t), y: yMoney(s.pnl) }));
+    const pnlPts = series.map((s) => ({ x: xAtTime(s.t), y: yPnl(s.pnl) }));
     const posPts = series.map((s) => ({ x: xAtTime(s.t), y: yPos(s.positions) }));
     const ddPts = series.map((s) => ({ x: xAtTime(s.t), y: yDd(s.drawdownPct) }));
 
-    const gridY = [0, 0.25, 0.5, 0.75, 1].map((f) => {
-      const v = maxM - f * (maxM - minM);
-      return { y: yMoney(v), label: money(v, 0) };
+    const moneyTicks = niceMoneyTicks(minM, maxM, 5).map((v) => ({
+      y: yMoney(v),
+      label: money(v, v >= 100 || v <= -100 ? 0 : 2),
+      value: v,
+    }));
+
+    const ddTicks =
+      layers.drawdown
+        ? [0, 0.5, 1].map((f) => {
+            const v = f * maxDd;
+            return { y: yDd(v), label: fmtPct(v, v < 1 ? 1 : 0) };
+          })
+        : [];
+
+    const timeTicks = [0, 0.5, 1].map((f) => {
+      const t = domain.start + span * f;
+      return {
+        x: PAD.left + innerW * f,
+        label: formatAxisTime(t, span),
+      };
     });
-    const ddTicks = [0, 0.5, 1].map((f) => {
-      const v = f * maxDd;
-      return { y: yDd(v), label: fmtPct(v, f === 0 ? 0 : 1) };
-    });
-
-    const dataSpan = series.length
-      ? series[series.length - 1].t - series[0].t
-      : 0;
-    const coverageNote =
-      series.length < 2
-        ? "Courbe en construction — échantillonnage live en cours"
-        : dataSpan > 0 && dataSpan < span * 0.35
-          ? `Données depuis ${formatAxisTime(series[0].t, span)} (historique encore court)`
-          : null;
-
-    // Mid tick for long windows so the domain is obvious.
-    const mid = domain.start + span / 2;
-    const timeTicks = [
-      { x: PAD.left, label: formatAxisTime(domain.start, span) },
-      { x: PAD.left + innerW / 2, label: formatAxisTime(mid, span) },
-      { x: PAD.left + innerW, label: formatAxisTime(domain.end, span) },
-    ];
-
-    const lastEquity = equityPts[equityPts.length - 1] ?? null;
-    const lastCash = cashPts[cashPts.length - 1] ?? null;
-    const lastPnl = pnlPts[pnlPts.length - 1] ?? null;
 
     return {
+      domain,
+      span,
+      innerW,
+      innerH,
       equityPts,
       cashPts,
       pnlPts,
       posPts,
       ddPts,
-      lastEquity,
-      lastCash,
-      lastPnl,
-      gridY,
+      moneyTicks,
       ddTicks,
       timeTicks,
-      coverageNote,
-      zeroY: yMoney(0),
-      pnlPositive: chartPnl >= 0,
+      baselineY: PAD.top + innerH,
+      zeroPnlY: yPnl(0),
+      xAtTime,
+      yMoney,
+      yPnl,
+      yPos,
+      yDd,
       pointCount: series.length,
-      domainSpanMs: span,
       hasSeries: series.length >= 1,
+      fitted: domain.fitted,
+      pnlPositive: chartPnl >= 0,
     };
-  }, [series, chartPnl, drawdownPct, range, sessionStartedAt, equity, cash, pnl, positions]);
+  }, [
+    series,
+    chartPnl,
+    drawdownPct,
+    range,
+    sessionStartedAt,
+    equity,
+    cash,
+    pnl,
+    positions,
+    layers.cash,
+    layers.drawdown,
+  ]);
+
+  function onPointerMove(e: ReactPointerEvent<SVGSVGElement>) {
+    if (!series.length || !svgRef.current) return;
+    const rect = svgRef.current.getBoundingClientRect();
+    const x = ((e.clientX - rect.left) / rect.width) * W;
+    const t =
+      geometry.domain.start +
+      ((x - PAD.left) / Math.max(1, geometry.innerW)) * geometry.span;
+    const idx = nearestIndex(series, t);
+    if (idx >= 0) setHoverIdx(idx);
+  }
+
+  const hoverSample = hoverIdx != null ? series[hoverIdx] : null;
+  const hoverX =
+    hoverSample != null ? geometry.xAtTime(hoverSample.t) : null;
 
   return (
-    <section className="card">
-      <div className="mb-3 flex flex-wrap items-start justify-between gap-3">
+    <section className="card overflow-hidden">
+      <div className="mb-4 flex flex-wrap items-start justify-between gap-3">
         <div>
-          <h2 className="text-lg font-medium">Paper — session live</h2>
-          <p className="text-xs text-muted">
-            Equity, cash, positions, P&amp;L et drawdown — choisissez l’échelle de temps
+          <div className="flex items-center gap-2">
+            <h2 className="text-lg font-medium tracking-tight">Paper — session live</h2>
+            {live ? (
+              <span className="inline-flex items-center gap-1.5 rounded-full bg-gain/15 px-2.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-gain">
+                <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-gain" />
+                Live
+              </span>
+            ) : (
+              <span className="rounded-full bg-slate-700/60 px-2.5 py-0.5 text-[10px] uppercase text-muted">
+                Connexion…
+              </span>
+            )}
+          </div>
+          <p className="mt-0.5 text-xs text-muted">
+            Courbe portfolio · survol pour le détail · calques à droite
           </p>
         </div>
-        <div className="flex flex-wrap items-center gap-2">
-          <div
-            className="flex flex-wrap gap-1 rounded-lg border border-line/70 bg-ink/40 p-1"
-            role="group"
-            aria-label="Échelle de temps du graphique paper"
-          >
-            {RANGE_OPTIONS.map((opt) => {
-              const active = range === opt.id;
-              return (
-                <button
-                  key={opt.id}
-                  type="button"
-                  title={opt.hint}
-                  disabled={loadingHistory}
-                  onClick={() => changeRange(opt.id)}
-                  className={
-                    active
-                      ? "rounded-md bg-sky-500/25 px-2.5 py-1 text-xs font-semibold text-sky-200"
-                      : "rounded-md px-2.5 py-1 text-xs text-muted hover:bg-slate-700/50 hover:text-slate-200"
-                  }
-                >
-                  {opt.label}
-                </button>
-              );
-            })}
-          </div>
-          {live ? (
-            <span className="rounded-full bg-gain/20 px-2.5 py-1 text-[10px] font-semibold uppercase tracking-wide text-gain">
-              Flux actif
-            </span>
-          ) : (
-            <span className="rounded-full bg-slate-700/60 px-2.5 py-1 text-[10px] uppercase text-muted">
-              Connexion…
-            </span>
-          )}
+        <div
+          className="flex flex-wrap gap-1 rounded-xl border border-line/70 bg-ink/50 p-1"
+          role="group"
+          aria-label="Échelle de temps"
+        >
+          {RANGE_OPTIONS.map((opt) => {
+            const activeRange = range === opt.id;
+            return (
+              <button
+                key={opt.id}
+                type="button"
+                title={opt.hint}
+                disabled={loadingHistory}
+                onClick={() => changeRange(opt.id)}
+                className={
+                  activeRange
+                    ? "rounded-lg bg-sky-500/30 px-2.5 py-1.5 text-xs font-semibold text-sky-100 shadow-sm shadow-sky-900/30"
+                    : "rounded-lg px-2.5 py-1.5 text-xs text-muted hover:bg-slate-700/40 hover:text-slate-200"
+                }
+              >
+                {opt.label}
+              </button>
+            );
+          })}
         </div>
       </div>
 
-      <div className="mb-3 grid grid-cols-2 gap-3 sm:grid-cols-5">
-        <Metric label="Equity" value={`${money(equity)} $`} />
-        <Metric label="Cash" value={`${money(cash)} $`} />
-        <Metric label="Positions" value={String(positions)} />
+      <div className="mb-4 grid grid-cols-2 gap-2 sm:grid-cols-5">
         <Metric
-          label="P&L total"
-          value={`${pnl >= 0 ? "+" : ""}${money(pnl)} $`}
-          className={pnlClass(pnl)}
+          label="Equity"
+          value={`${money(active?.equity ?? equity)} $`}
+          accent={COLORS.equity}
+          highlight={hoverSample != null}
+        />
+        <Metric
+          label="Cash"
+          value={`${money(active?.cash ?? cash)} $`}
+          accent={COLORS.cash}
+          highlight={hoverSample != null}
+        />
+        <Metric
+          label="Positions"
+          value={String(active?.positions ?? positions)}
+          accent={COLORS.positions}
+          highlight={hoverSample != null}
+        />
+        <Metric
+          label="P&L"
+          value={`${(active?.pnl ?? pnl) >= 0 ? "+" : ""}${money(active?.pnl ?? pnl)} $`}
+          className={pnlClass(active?.pnl ?? pnl)}
+          accent={(active?.pnl ?? pnl) >= 0 ? COLORS.pnl : COLORS.pnlNeg}
+          highlight={hoverSample != null}
         />
         <Metric
           label="Drawdown"
-          value={fmtPct(drawdownPct)}
-          className={drawdownPct > 0.05 ? "text-loss" : ""}
+          value={fmtPct(active?.drawdownPct ?? drawdownPct)}
+          className={(active?.drawdownPct ?? drawdownPct) > 0.05 ? "text-loss" : ""}
+          accent={COLORS.drawdown}
+          highlight={hoverSample != null}
         />
       </div>
 
@@ -424,160 +616,320 @@ export function PaperSessionChart({
         <p className="mb-2 text-xs text-orange-300">{historyError}</p>
       ) : null}
 
-      {loadingHistory && !geometry?.hasSeries ? (
-        <div className="flex h-[242px] items-center justify-center rounded-lg border border-dashed border-line/60 text-sm text-muted">
-          Chargement de l’échelle {range}…
+      <div className="relative rounded-xl border border-line/50 bg-gradient-to-b from-slate-950/80 to-ink/90 p-2 sm:p-3">
+        <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+          <div className="flex flex-wrap gap-1.5">
+            {(
+              [
+                ["equity", "Equity", COLORS.equity],
+                ["cash", "Cash", COLORS.cash],
+                ["pnl", "P&L", chartPnl >= 0 ? COLORS.pnl : COLORS.pnlNeg],
+                ["positions", "Positions", COLORS.positions],
+                ["drawdown", "DD %", COLORS.drawdown],
+              ] as Array<[SeriesKey, string, string]>
+            ).map(([key, label, color]) => {
+              const on = layers[key];
+              const locked = key === "equity";
+              return (
+                <button
+                  key={key}
+                  type="button"
+                  disabled={locked}
+                  onClick={() => toggleLayer(key)}
+                  className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] font-medium transition ${
+                    on
+                      ? "border-white/15 bg-white/5 text-slate-100"
+                      : "border-transparent text-muted opacity-55 hover:opacity-80"
+                  }`}
+                  title={locked ? "Toujours visible" : on ? "Masquer" : "Afficher"}
+                >
+                  <span
+                    className="h-2 w-2 rounded-full"
+                    style={{ backgroundColor: on ? color : "#475569" }}
+                  />
+                  {label}
+                </button>
+              );
+            })}
+          </div>
+          <p className="text-[11px] tabular-nums text-muted">
+            {loadingHistory ? "Maj…" : `${series.length} pts`}
+            {geometry.fitted ? " · zoom auto" : ""} ·{" "}
+            {RANGE_OPTIONS.find((o) => o.id === range)?.label ?? range}
+            {hoverSample
+              ? ` · ${formatAxisTime(hoverSample.t, geometry.span)}`
+              : ""}
+          </p>
         </div>
-      ) : !geometry ? (
-        <div className="flex h-[242px] items-center justify-center rounded-lg border border-dashed border-line/60 text-sm text-muted">
-          Fenêtre indisponible.
-        </div>
-      ) : (
-        <svg
-          viewBox={`0 0 ${W} ${H}`}
-          className="h-auto w-full overflow-visible"
-          role="img"
-          aria-label={`Évolution paper sur ${range}`}
-        >
-          {geometry.gridY.map((g) => (
-            <g key={`m-${g.y}`}>
-              <line
-                x1={PAD.left}
-                x2={W - PAD.right}
-                y1={g.y}
-                y2={g.y}
-                stroke={COLORS.grid}
-                strokeWidth={1}
-              />
-              <text
-                x={PAD.left - 6}
-                y={g.y + 3}
-                textAnchor="end"
-                className="fill-slate-500"
-                fontSize={9}
-              >
-                {g.label}
-              </text>
-            </g>
-          ))}
-          {geometry.ddTicks.map((g) => (
-            <text
-              key={`dd-${g.y}`}
-              x={W - PAD.right + 6}
-              y={g.y + 3}
-              textAnchor="start"
-              fill={COLORS.drawdown}
-              fontSize={9}
-              opacity={0.9}
-            >
-              {g.label}
-            </text>
-          ))}
-          <line
-            x1={PAD.left}
-            x2={W - PAD.right}
-            y1={geometry.zeroY}
-            y2={geometry.zeroY}
-            stroke={COLORS.axis}
-            strokeDasharray="4 4"
-            strokeWidth={1}
-          />
-          <path
-            d={linePath(geometry.posPts)}
-            fill="none"
-            stroke={COLORS.positions}
-            strokeWidth={1.5}
-            strokeDasharray="3 3"
-            opacity={0.75}
-          />
-          <path
-            d={linePath(geometry.ddPts)}
-            fill="none"
-            stroke={COLORS.drawdown}
-            strokeWidth={2}
-            strokeDasharray="5 3"
-          />
-          <path d={linePath(geometry.cashPts)} fill="none" stroke={COLORS.cash} strokeWidth={1.75} />
-          <path
-            d={linePath(geometry.pnlPts)}
-            fill="none"
-            stroke={geometry.pnlPositive ? COLORS.pnl : COLORS.pnlNeg}
-            strokeWidth={1.75}
-          />
-          <path
-            d={linePath(geometry.equityPts)}
-            fill="none"
-            stroke={COLORS.equity}
-            strokeWidth={2.25}
-          />
-          {geometry.pointCount === 1 && geometry.lastEquity ? (
-            <>
-              {geometry.lastCash ? (
-                <circle
-                  cx={geometry.lastCash.x}
-                  cy={geometry.lastCash.y}
-                  r={3.5}
-                  fill={COLORS.cash}
-                />
-              ) : null}
-              {geometry.lastPnl ? (
-                <circle
-                  cx={geometry.lastPnl.x}
-                  cy={geometry.lastPnl.y}
-                  r={3.5}
-                  fill={geometry.pnlPositive ? COLORS.pnl : COLORS.pnlNeg}
-                />
-              ) : null}
-              <circle
-                cx={geometry.lastEquity.x}
-                cy={geometry.lastEquity.y}
-                r={4.5}
-                fill={COLORS.equity}
-                stroke="#0b1220"
-                strokeWidth={1.5}
-              />
-            </>
-          ) : null}
-          {geometry.timeTicks.map((tick, i) => (
-            <text
-              key={`t-${tick.x}-${tick.label}`}
-              x={tick.x}
-              y={H - 8}
-              textAnchor={i === 0 ? "start" : i === geometry.timeTicks.length - 1 ? "end" : "middle"}
-              className="fill-slate-400"
-              fontSize={9}
-            >
-              {tick.label}
-            </text>
-          ))}
-          <text
-            x={W - PAD.right + 6}
-            y={PAD.top - 4}
-            textAnchor="start"
-            fill={COLORS.drawdown}
-            fontSize={8}
+
+        {loadingHistory && !geometry.hasSeries ? (
+          <div className="flex h-[320px] items-center justify-center text-sm text-muted">
+            Chargement de la courbe…
+          </div>
+        ) : (
+          <svg
+            ref={svgRef}
+            viewBox={`0 0 ${W} ${H}`}
+            className="h-auto w-full touch-pan-y"
+            role="img"
+            aria-label={`Évolution paper sur ${range}`}
+            onPointerMove={onPointerMove}
+            onPointerLeave={() => setHoverIdx(null)}
           >
-            DD %
-          </text>
-        </svg>
-      )}
+            <defs>
+              <linearGradient id="equityFill" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stopColor={COLORS.equity} stopOpacity="0.35" />
+                <stop offset="100%" stopColor={COLORS.equity} stopOpacity="0.02" />
+              </linearGradient>
+              <filter id="softGlow" x="-20%" y="-20%" width="140%" height="140%">
+                <feGaussianBlur stdDeviation="2.2" result="blur" />
+                <feMerge>
+                  <feMergeNode in="blur" />
+                  <feMergeNode in="SourceGraphic" />
+                </feMerge>
+              </filter>
+            </defs>
 
-      {geometry?.coverageNote ? (
-        <p className="mt-1 text-[11px] text-amber-200/90">{geometry.coverageNote}</p>
-      ) : null}
+            {geometry.moneyTicks.map((g) => (
+              <g key={`m-${g.value}`}>
+                <line
+                  x1={PAD.left}
+                  x2={W - PAD.right}
+                  y1={g.y}
+                  y2={g.y}
+                  stroke={COLORS.grid}
+                  strokeWidth={1}
+                />
+                <text
+                  x={PAD.left - 8}
+                  y={g.y + 3}
+                  textAnchor="end"
+                  fill="#94a3b8"
+                  fontSize={10}
+                  fontFamily="ui-monospace, SFMono-Regular, Menlo, monospace"
+                >
+                  {g.label}
+                </text>
+              </g>
+            ))}
 
-      <div className="mt-2 flex flex-wrap items-center justify-between gap-2 text-xs text-muted">
-        <ul className="flex flex-wrap gap-4">
-          <Legend color={COLORS.equity} label="Equity" />
-          <Legend color={COLORS.cash} label="Cash" />
-          <Legend color={pnl >= 0 ? COLORS.pnl : COLORS.pnlNeg} label="P&L" />
-          <Legend color={COLORS.positions} label="Positions" dashed />
-          <Legend color={COLORS.drawdown} label="Drawdown % (axe droit)" dashed />
-        </ul>
-        <span>
-          {loadingHistory ? "Maj…" : `${series.length} pts`} · fenêtre{" "}
-          {RANGE_OPTIONS.find((o) => o.id === range)?.label ?? range}
-        </span>
+            {layers.drawdown
+              ? geometry.ddTicks.map((g, i) => (
+                  <text
+                    key={`dd-${i}-${g.label}`}
+                    x={W - PAD.right + 8}
+                    y={g.y + 3}
+                    textAnchor="start"
+                    fill={COLORS.drawdown}
+                    fontSize={10}
+                    opacity={0.85}
+                    fontFamily="ui-monospace, SFMono-Regular, Menlo, monospace"
+                  >
+                    {g.label}
+                  </text>
+                ))
+              : null}
+
+            {layers.drawdown ? (
+              <text
+                x={W - PAD.right + 8}
+                y={PAD.top - 10}
+                textAnchor="start"
+                fill={COLORS.drawdown}
+                fontSize={9}
+                opacity={0.7}
+              >
+                DD
+              </text>
+            ) : null}
+
+            {layers.positions && geometry.pointCount > 0 ? (
+              <path
+                d={linePath(geometry.posPts)}
+                fill="none"
+                stroke={COLORS.positions}
+                strokeWidth={1.5}
+                strokeDasharray="4 4"
+                opacity={0.7}
+              />
+            ) : null}
+
+            {layers.drawdown && geometry.pointCount > 0 ? (
+              <path
+                d={linePath(geometry.ddPts)}
+                fill="none"
+                stroke={COLORS.drawdown}
+                strokeWidth={1.75}
+                strokeDasharray="5 3"
+                opacity={0.85}
+              />
+            ) : null}
+
+            {layers.pnl && geometry.pointCount > 0 ? (
+              <>
+                <line
+                  x1={PAD.left}
+                  x2={W - PAD.right}
+                  y1={geometry.zeroPnlY}
+                  y2={geometry.zeroPnlY}
+                  stroke={COLORS.axis}
+                  strokeDasharray="3 4"
+                  strokeWidth={1}
+                  opacity={0.5}
+                />
+                <path
+                  d={linePath(geometry.pnlPts)}
+                  fill="none"
+                  stroke={geometry.pnlPositive ? COLORS.pnl : COLORS.pnlNeg}
+                  strokeWidth={1.75}
+                  opacity={0.9}
+                />
+              </>
+            ) : null}
+
+            {layers.cash && geometry.pointCount > 0 ? (
+              <path
+                d={linePath(geometry.cashPts)}
+                fill="none"
+                stroke={COLORS.cash}
+                strokeWidth={2}
+                opacity={0.9}
+              />
+            ) : null}
+
+            {geometry.pointCount > 0 ? (
+              <>
+                <path
+                  d={areaPath(geometry.equityPts, geometry.baselineY)}
+                  fill="url(#equityFill)"
+                />
+                <path
+                  d={linePath(geometry.equityPts)}
+                  fill="none"
+                  stroke={COLORS.equity}
+                  strokeWidth={2.6}
+                  filter="url(#softGlow)"
+                  strokeLinejoin="round"
+                  strokeLinecap="round"
+                />
+              </>
+            ) : null}
+
+            {geometry.pointCount === 1 && geometry.equityPts[0] ? (
+              <circle
+                cx={geometry.equityPts[0].x}
+                cy={geometry.equityPts[0].y}
+                r={5}
+                fill={COLORS.equity}
+                stroke={COLORS.panel}
+                strokeWidth={2}
+              />
+            ) : null}
+
+            {geometry.equityPts.length > 0 ? (
+              <g>
+                <circle
+                  cx={geometry.equityPts[geometry.equityPts.length - 1].x}
+                  cy={geometry.equityPts[geometry.equityPts.length - 1].y}
+                  r={4.5}
+                  fill={COLORS.equity}
+                  stroke={COLORS.panel}
+                  strokeWidth={2}
+                />
+              </g>
+            ) : null}
+
+            {hoverX != null && hoverSample ? (
+              <g pointerEvents="none">
+                <line
+                  x1={hoverX}
+                  x2={hoverX}
+                  y1={PAD.top}
+                  y2={H - PAD.bottom}
+                  stroke={COLORS.cross}
+                  strokeWidth={1}
+                />
+                <circle
+                  cx={hoverX}
+                  cy={geometry.yMoney(hoverSample.equity)}
+                  r={5}
+                  fill={COLORS.equity}
+                  stroke="#fff"
+                  strokeWidth={1.5}
+                />
+                <rect
+                  x={Math.min(hoverX + 12, W - PAD.right - 150)}
+                  y={PAD.top + 4}
+                  width={138}
+                  height={74}
+                  rx={8}
+                  fill="rgba(15,23,42,0.92)"
+                  stroke="rgba(148,163,184,0.25)"
+                />
+                <text
+                  x={Math.min(hoverX + 12, W - PAD.right - 150) + 10}
+                  y={PAD.top + 22}
+                  fill="#e2e8f0"
+                  fontSize={10}
+                  fontFamily="ui-monospace, SFMono-Regular, Menlo, monospace"
+                >
+                  {formatAxisTime(hoverSample.t, geometry.span)}
+                </text>
+                <text
+                  x={Math.min(hoverX + 12, W - PAD.right - 150) + 10}
+                  y={PAD.top + 40}
+                  fill={COLORS.equity}
+                  fontSize={11}
+                  fontFamily="ui-monospace, SFMono-Regular, Menlo, monospace"
+                >
+                  Eq {money(hoverSample.equity)} $
+                </text>
+                <text
+                  x={Math.min(hoverX + 12, W - PAD.right - 150) + 10}
+                  y={PAD.top + 56}
+                  fill={COLORS.cash}
+                  fontSize={11}
+                  fontFamily="ui-monospace, SFMono-Regular, Menlo, monospace"
+                >
+                  Cash {money(hoverSample.cash)} $
+                </text>
+                <text
+                  x={Math.min(hoverX + 12, W - PAD.right - 150) + 10}
+                  y={PAD.top + 72}
+                  fill={hoverSample.pnl >= 0 ? COLORS.pnl : COLORS.pnlNeg}
+                  fontSize={11}
+                  fontFamily="ui-monospace, SFMono-Regular, Menlo, monospace"
+                >
+                  P&L {hoverSample.pnl >= 0 ? "+" : ""}
+                  {money(hoverSample.pnl)} $
+                </text>
+              </g>
+            ) : null}
+
+            {geometry.timeTicks.map((tick, i) => (
+              <text
+                key={`t-${tick.x}-${tick.label}`}
+                x={tick.x}
+                y={H - 12}
+                textAnchor={i === 0 ? "start" : i === geometry.timeTicks.length - 1 ? "end" : "middle"}
+                fill="#94a3b8"
+                fontSize={10}
+                fontFamily="ui-monospace, SFMono-Regular, Menlo, monospace"
+              >
+                {tick.label}
+              </text>
+            ))}
+
+            {/* Invisible hit area */}
+            <rect
+              x={PAD.left}
+              y={PAD.top}
+              width={geometry.innerW}
+              height={geometry.innerH}
+              fill="transparent"
+            />
+          </svg>
+        )}
       </div>
     </section>
   );
@@ -587,38 +939,30 @@ function Metric({
   label,
   value,
   className = "",
+  accent,
+  highlight,
 }: {
   label: string;
   value: string;
   className?: string;
+  accent?: string;
+  highlight?: boolean;
 }) {
   return (
-    <div>
-      <p className="text-[10px] uppercase tracking-wide text-muted">{label}</p>
-      <p className={`text-base font-medium tabular-nums ${className}`}>{value}</p>
+    <div
+      className={`rounded-lg border px-3 py-2 transition ${
+        highlight ? "border-sky-500/30 bg-sky-500/5" : "border-line/60 bg-ink/40"
+      }`}
+    >
+      <p className="flex items-center gap-1.5 text-[10px] uppercase tracking-wide text-muted">
+        {accent ? (
+          <span className="h-1.5 w-1.5 rounded-full" style={{ backgroundColor: accent }} />
+        ) : null}
+        {label}
+      </p>
+      <p className={`mt-0.5 text-base font-semibold tabular-nums tracking-tight ${className}`}>
+        {value}
+      </p>
     </div>
-  );
-}
-
-function Legend({
-  color,
-  label,
-  dashed,
-}: {
-  color: string;
-  label: string;
-  dashed?: boolean;
-}) {
-  return (
-    <li className="flex items-center gap-1.5">
-      <span
-        className="inline-block h-0.5 w-4 rounded"
-        style={{
-          backgroundColor: dashed ? "transparent" : color,
-          borderTop: dashed ? `2px dashed ${color}` : undefined,
-        }}
-      />
-      {label}
-    </li>
   );
 }
