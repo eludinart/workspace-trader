@@ -30,7 +30,14 @@ export type Account = {
     mark_price: number;
     market_value: number;
     unrealized_pnl: number;
+    gross_pnl?: number;
+    net_pnl?: number;
+    net_pnl_pct?: number;
+    fees_total?: number;
+    would_be_green?: boolean;
   }>;
+  fee_bps?: number;
+  slippage_bps?: number;
   symbol: string;
   symbols?: string[];
   active_symbol?: string;

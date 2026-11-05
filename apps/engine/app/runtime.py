@@ -21,6 +21,7 @@ from app.risk import (
     annotate_levels,
     compute_exit_levels,
     dynamic_max_open,
+    net_pnl_if_closed,
     portfolio_open_risk_r,
     risk_position_spend,
     sell_is_net_positive,
@@ -1650,6 +1651,29 @@ class TradingRuntime:
         refresh_open = self.lease is None
         prices = self.prices_map(refresh_open=refresh_open)
         snap = self.wallet.snapshot(prices)
+        # Net PnL if closed now (entry fee + exit fee + sell slippage).
+        enriched: list[dict[str, Any]] = []
+        for row in snap.get("positions") or []:
+            if not isinstance(row, dict):
+                continue
+            net = net_pnl_if_closed(
+                float(row.get("avg_entry") or 0),
+                float(row.get("qty") or 0),
+                float(row.get("mark_price") or 0),
+                fee_bps=float(self.params.fee_bps),
+                slippage_bps=float(self.params.slippage_bps),
+            )
+            enriched.append(
+                {
+                    **row,
+                    "gross_pnl": net["gross_pnl"],
+                    "net_pnl": net["net_pnl"],
+                    "net_pnl_pct": net["net_pnl_pct"],
+                    "fees_total": net["fees_total"],
+                    "would_be_green": net["would_be_green"],
+                }
+            )
+        snap["positions"] = enriched
         equity = float(snap["equity"])
         self.peak_equity = max(self.peak_equity, equity)
         dd = 0.0
@@ -1657,6 +1681,8 @@ class TradingRuntime:
             dd = ((self.peak_equity - equity) / self.peak_equity) * 100
         return {
             **snap,
+            "fee_bps": self.params.fee_bps,
+            "slippage_bps": self.params.slippage_bps,
             "symbol": self.params.symbol,
             "symbols": self.watchlist(),
             "active_symbol": self.active_symbol,

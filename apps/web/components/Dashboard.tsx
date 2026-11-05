@@ -1192,8 +1192,8 @@ export function Dashboard() {
         <section className="card md:col-span-4">
           <h2 className="mb-2 text-lg font-medium">Positions</h2>
           <p className="mb-3 text-xs text-muted">
-            Vert = gagnante · rouge = perdante · mini-courbe = évolution du % depuis l’ouverture
-            de cette session UI
+            « Gagnante nette » = encore positif si tu vends maintenant après frais + slippage.
+            Rouge = perdante. Ambre = brut positif mais sous les frais.
           </p>
           <PositionsPanel
             positions={account?.positions || []}

@@ -35,20 +35,37 @@ export function formatPrice(n: number): string {
 function formatQty(n: number): string {
   if (!Number.isFinite(n)) return "—";
   const abs = Math.abs(n);
-  if (abs >= 1_000_000) return `${(n / 1_000_000).toLocaleString("fr-FR", { maximumFractionDigits: 2 })}M`;
+  if (abs >= 1_000_000) {
+    return `${(n / 1_000_000).toLocaleString("fr-FR", { maximumFractionDigits: 2 })}M`;
+  }
   if (abs >= 10_000) return n.toLocaleString("fr-FR", { maximumFractionDigits: 0 });
   if (abs >= 1) return n.toLocaleString("fr-FR", { maximumFractionDigits: 4 });
   return n.toLocaleString("fr-FR", { maximumFractionDigits: 6 });
 }
 
-function pnlPct(p: Position): number {
+/** Net after fees if available; else gross unrealized. */
+function netPnl(p: Position): number {
+  if (typeof p.net_pnl === "number" && Number.isFinite(p.net_pnl)) return p.net_pnl;
+  return p.unrealized_pnl;
+}
+
+function netPct(p: Position): number {
+  if (typeof p.net_pnl_pct === "number" && Number.isFinite(p.net_pnl_pct)) return p.net_pnl_pct;
   if (!p.avg_entry || p.avg_entry <= 0) return 0;
   return ((p.mark_price - p.avg_entry) / p.avg_entry) * 100;
 }
 
-function tone(pnl: number): "gain" | "loss" | "flat" {
-  if (pnl > 0.005) return "gain";
-  if (pnl < -0.005) return "loss";
+function isTrulyGreen(p: Position): boolean {
+  if (typeof p.would_be_green === "boolean") return p.would_be_green;
+  return netPnl(p) > 0;
+}
+
+function tone(p: Position): "gain" | "loss" | "flat" {
+  const net = netPnl(p);
+  if (isTrulyGreen(p) && net > 0.005) return "gain";
+  if (net < -0.005) return "loss";
+  // Gross positive but fees eat the edge → not a real win yet.
+  if (p.unrealized_pnl > 0.005 && net <= 0.005) return "flat";
   return "flat";
 }
 
@@ -96,23 +113,23 @@ function usePnlSparks(positions: Position[]): Record<string, number[]> {
   const lastKey = useRef("");
 
   useEffect(() => {
-    const open = new Set(positions.map((p) => p.symbol));
     const stamp = positions
-      .map((p) => `${p.symbol}:${p.mark_price.toFixed(10)}:${p.unrealized_pnl.toFixed(4)}`)
+      .map((p) => `${p.symbol}:${netPnl(p).toFixed(4)}:${netPct(p).toFixed(4)}`)
       .join("|");
     if (stamp === lastKey.current) return;
     lastKey.current = stamp;
 
     setSparks((prev) => {
       const next: Record<string, number[]> = {};
+      const open = new Set(positions.map((p) => p.symbol));
       for (const p of positions) {
-        const pct = pnlPct(p);
-        const hist = [...(prev[p.symbol] || []), pct].slice(-SPARK_MAX);
+        const hist = [...(prev[p.symbol] || []), netPct(p)].slice(-SPARK_MAX);
         next[p.symbol] = hist;
       }
-      // Drop closed symbols.
       for (const sym of Object.keys(prev)) {
-        if (!open.has(sym)) continue;
+        if (!open.has(sym)) {
+          /* dropped */
+        }
       }
       return next;
     });
@@ -132,8 +149,7 @@ export function PositionsPanel({
 }: PositionsPanelProps) {
   const sparks = usePnlSparks(positions);
   const sorted = useMemo(
-    () =>
-      [...positions].sort((a, b) => Math.abs(b.unrealized_pnl) - Math.abs(a.unrealized_pnl)),
+    () => [...positions].sort((a, b) => netPnl(b) - netPnl(a)),
     [positions],
   );
 
@@ -146,8 +162,11 @@ export function PositionsPanel({
   return (
     <ul className={compact ? "space-y-2" : "space-y-2.5"}>
       {sorted.map((p) => {
-        const pct = pnlPct(p);
-        const kind = tone(p.unrealized_pnl);
+        const net = netPnl(p);
+        const pct = netPct(p);
+        const kind = tone(p);
+        const fees = typeof p.fees_total === "number" ? p.fees_total : null;
+        const gross = typeof p.gross_pnl === "number" ? p.gross_pnl : p.unrealized_pnl;
         const border =
           kind === "gain"
             ? "border-gain/40 bg-gain/5"
@@ -161,9 +180,15 @@ export function PositionsPanel({
             ? "bg-gain/20 text-gain"
             : kind === "loss"
               ? "bg-loss/20 text-loss"
-              : "bg-slate-700/60 text-muted";
+              : "bg-amber-500/15 text-amber-200";
         const badgeText =
-          kind === "gain" ? "Gagnante" : kind === "loss" ? "Perdante" : "Neutre";
+          kind === "gain"
+            ? "Gagnante nette"
+            : kind === "loss"
+              ? "Perdante"
+              : gross > 0
+                ? "Sous les frais"
+                : "Neutre";
         const spark = sparks[p.symbol] || [pct];
 
         return (
@@ -176,7 +201,7 @@ export function PositionsPanel({
                 onClick={() => onPick?.(p.symbol)}
               >
                 <div className="flex flex-wrap items-center justify-between gap-2">
-                  <div className="flex items-center gap-2">
+                  <div className="flex flex-wrap items-center gap-2">
                     <span className="font-semibold tracking-tight">{p.symbol}</span>
                     <span
                       className={`rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide ${badge}`}
@@ -185,9 +210,9 @@ export function PositionsPanel({
                     </span>
                   </div>
                   <div className="text-right">
-                    <p className={`text-sm font-semibold tabular-nums ${pnlClass(p.unrealized_pnl)}`}>
-                      {p.unrealized_pnl >= 0 ? "+" : ""}
-                      {money(p.unrealized_pnl)} $
+                    <p className={`text-sm font-semibold tabular-nums ${pnlClass(net)}`}>
+                      {net >= 0 ? "+" : ""}
+                      {money(net)} $ net
                     </p>
                     <p className={`text-xs tabular-nums ${pnlClass(pct)}`}>
                       {pct >= 0 ? "+" : ""}
@@ -202,14 +227,25 @@ export function PositionsPanel({
 
                 <div className="mt-2 grid grid-cols-[1fr_auto] items-end gap-2">
                   <div>
-                    <Sparkline points={spark} positive={pct >= 0} />
+                    <Sparkline points={spark} positive={net >= 0} />
                     <p className="mt-1 text-[11px] text-muted">
                       qté {formatQty(p.qty)} · entrée {formatPrice(p.avg_entry)} · cours{" "}
                       {formatPrice(p.mark_price)}
                     </p>
+                    <p className="text-[11px] text-muted">
+                      brut {gross >= 0 ? "+" : ""}
+                      {money(gross)} $
+                      {fees != null ? ` · frais ~${money(fees)} $` : ""}
+                      {" · "}
+                      {kind === "gain"
+                        ? "sortie maintenant = encore gagnant"
+                        : kind === "loss"
+                          ? "sortie maintenant = perte"
+                          : "pas encore au-dessus des frais"}
+                    </p>
                   </div>
                   {!compact ? (
-                    <p className="pb-5 text-right text-[11px] tabular-nums text-muted">
+                    <p className="pb-8 text-right text-[11px] tabular-nums text-muted">
                       {money(p.market_value)} $
                     </p>
                   ) : null}
