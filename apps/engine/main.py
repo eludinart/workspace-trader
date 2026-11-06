@@ -31,6 +31,8 @@ from app.signals.mtf import evaluate_mtf_gate
 from app.signals.onchain import stub_onchain
 from app.signals.oos import evaluate_oos
 from app.signals.passive_wake import evaluate_passive_wake
+from app.signals.providers import list_provider_specs
+from app.signals.risk_caps import HARD_RISK_PER_TRADE_PCT
 from app.signals.super_opp import detect_super_opportunity
 from app.store import Store
 from app.wallet import annotate_trade_for_display
@@ -189,6 +191,8 @@ class ParamsUpdate(BaseModel):
     latency_wall_clock: bool | None = None
     order_impact_enabled: bool | None = None
     impact_bps_max: float | None = Field(default=None, ge=0, le=50)
+    order_book_depth_enabled: bool | None = None
+    order_book_depth_levels: int | None = Field(default=None, ge=1, le=20)
     confluence_enabled: bool | None = None
     mtf_enabled: bool | None = None
     kelly_enabled: bool | None = None
@@ -214,7 +218,7 @@ class ParamsUpdate(BaseModel):
     universe_size: int | None = Field(default=None, ge=10, le=80)
     universe_min_volume_usd: float | None = Field(default=None, ge=0)
     universe_refresh_hours: float | None = Field(default=None, ge=1, le=48)
-    risk_per_trade_pct: float | None = Field(default=None, gt=0, le=0.05)
+    risk_per_trade_pct: float | None = Field(default=None, gt=0, le=0.02)
     atr_stop_mult: float | None = Field(default=None, ge=1, le=4)
     reward_risk: float | None = Field(default=None, ge=1, le=5)
     min_hold_min: int | None = Field(default=None, ge=0, le=24 * 60)
@@ -371,18 +375,32 @@ def get_signal_stubs(symbol: str | None = None) -> dict[str, Any]:
     """Read-only status of points 14–21 stubs (all gated by flags, off by default)."""
     flags = runtime.signal_flags()
     sym = (symbol or runtime.params.symbol or "BTC-USD").upper()
-    pnls = [float(t.realized_pnl) for t in runtime.wallet.trades if t.side == "sell"]
+    pnls = [
+        float(t.realized_pnl)
+        for t in runtime.wallet.trades
+        if t.side == "sell" and getattr(t, "meta_complete", False)
+    ]
+    oos = evaluate_oos(pnls)
+    kelly = evaluate_kelly(
+        pnls,
+        enabled=flags.kelly_enabled,
+        oos_activation_allowed=bool(oos.activation_allowed),
+        allow_sizing=False,
+    )
     return {
         "flags": flags.as_dict(),
+        "hard_risk_per_trade_pct": HARD_RISK_PER_TRADE_PCT,
+        "oos": oos.to_dict(),
         "confluence": score_confluence({}, enabled=flags.confluence_enabled).to_dict(),
         "mtf": evaluate_mtf_gate(
             enabled=flags.mtf_enabled, intended_side="buy"
         ).to_dict(),
-        "kelly": evaluate_kelly(pnls, enabled=flags.kelly_enabled).to_dict(),
+        "kelly": kelly.to_dict(),
         "onchain": {
             k: stub_onchain(k, sym, enabled=flags.onchain_enabled).to_dict()  # type: ignore[arg-type]
             for k in ("whales", "funding", "liquidations")
         },
+        "providers": list_provider_specs(),
         "super_opp": detect_super_opportunity(
             enabled=flags.super_opp_enabled,
             risk_per_trade_pct=float(runtime.params.risk_per_trade_pct),
@@ -397,6 +415,11 @@ def get_signal_stubs(symbol: str | None = None) -> dict[str, Any]:
         "web_push": {
             "enabled": flags.web_push_enabled,
             "note": "VAPID via env only; no Telegram; HTTPS domain required",
+        },
+        "order_book_depth": {
+            "enabled": bool(getattr(runtime.params, "order_book_depth_enabled", False)),
+            "levels": int(getattr(runtime.params, "order_book_depth_levels", 5) or 5),
+            "label": "simulated_book:hypothesis",
         },
     }
 

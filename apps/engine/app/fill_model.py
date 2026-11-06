@@ -63,6 +63,116 @@ def impact_bps_for_notional(
     return float(max_impact_bps) * (ratio**0.5)
 
 
+@dataclass(frozen=True)
+class BookLevel:
+    price: float
+    size: float
+
+
+@dataclass(frozen=True)
+class SimulatedBook:
+    """Synthetic L2 book around mid — labeled simulation, not a live exchange feed."""
+
+    mid: float
+    bids: tuple[BookLevel, ...]
+    asks: tuple[BookLevel, ...]
+    depth_levels: int
+    label: str = "simulated_book:hypothesis"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "mid": self.mid,
+            "bids": [{"price": b.price, "size": b.size} for b in self.bids],
+            "asks": [{"price": a.price, "size": a.size} for a in self.asks],
+            "depth_levels": self.depth_levels,
+            "label": self.label,
+            "confidence_tier": "hypothesis",
+        }
+
+
+def simulate_order_book(
+    mid: float,
+    *,
+    depth_levels: int = 5,
+    tick_bps: float = 1.0,
+    base_size: float = 0.05,
+    size_growth: float = 1.35,
+) -> SimulatedBook:
+    """Build a symmetric depth ladder for paper latency/impact walks."""
+    mid_f = float(mid)
+    n = max(1, int(depth_levels))
+    tick = mid_f * (max(0.1, float(tick_bps)) / 10_000.0)
+    bids: list[BookLevel] = []
+    asks: list[BookLevel] = []
+    size = max(1e-8, float(base_size))
+    for i in range(1, n + 1):
+        bids.append(BookLevel(price=mid_f - tick * i, size=size))
+        asks.append(BookLevel(price=mid_f + tick * i, size=size))
+        size *= float(size_growth)
+    return SimulatedBook(
+        mid=mid_f,
+        bids=tuple(bids),
+        asks=tuple(asks),
+        depth_levels=n,
+    )
+
+
+def walk_book_fill(
+    side: str,
+    mid: float,
+    notional: float,
+    *,
+    latency_ms: int = 0,
+    depth_levels: int = 5,
+    base_slip_bps: float = 5.0,
+) -> FillQuote:
+    """Fill by walking simulated depth; latency widens effective slip slightly.
+
+    Still paper-only. Extra slip from depth + latency is capped and additive to
+    ``base_slip_bps``. Impact is the walked adverse vs mid expressed in bps.
+    """
+    book = simulate_order_book(mid, depth_levels=depth_levels)
+    levels = book.asks if side == "buy" else book.bids
+    remaining = max(0.0, float(notional))
+    spent = 0.0
+    qty = 0.0
+    for lvl in levels:
+        if remaining <= 0 or lvl.price <= 0:
+            break
+        level_notional = lvl.price * lvl.size
+        take = min(remaining, level_notional)
+        take_qty = take / lvl.price
+        spent += take
+        qty += take_qty
+        remaining -= take
+    if qty <= 0:
+        # Empty book fallback — pure adverse base slip.
+        return quote_fill(
+            side,
+            mid,
+            slip_bps=base_slip_bps,
+            latency_ms=latency_ms,
+            impact_bps=0.0,
+        )
+    avg = spent / qty
+    # Latency: each 100ms adds ~0.5 bps adverse (cap 5 bps).
+    latency_extra = min(5.0, max(0, int(latency_ms)) / 100.0 * 0.5)
+    # Convert walked distance to bps vs mid.
+    if side == "buy":
+        walked_bps = max(0.0, (avg / mid - 1.0) * 10_000.0) if mid > 0 else 0.0
+    else:
+        walked_bps = max(0.0, (1.0 - avg / mid) * 10_000.0) if mid > 0 else 0.0
+    impact = max(0.0, walked_bps - float(base_slip_bps))
+    return quote_fill(
+        side,
+        mid,
+        slip_bps=float(base_slip_bps) + latency_extra,
+        latency_ms=latency_ms,
+        impact_bps=impact,
+        fill_mid=mid,
+    )
+
+
 def quote_fill(
     side: str,
     decision_price: float,
