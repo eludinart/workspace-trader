@@ -30,7 +30,9 @@ Architecture inspirée de frameworks modulaires type Hummingbot (connectors / st
 - **Backtest** historique Coinbase (PnL, win rate, max drawdown)
 - **Kill switch** manuel + auto (perte / drawdown)
 - Alertes **Web Push** PWA (VAPID env) — Telegram présent mais non recommandé
-- Stubs signaux 14–21 derrière flags **off** par défaut (`/signals/stubs`, `/signals/oos`)
+- Signaux 14–21 derrière flags **off** par défaut ; confluence/MTF branchés (shadow si OOS refuse) ; Kelly **éval-only** ; risque dur **2%/trade** (`docs/SIGNAL_LOTS_STATE.md`)
+- Web Push VAPID (pas Telegram) + veille passive déterministe
+- Carnet papier profondeur/latence optionnel (`order_book_depth_*`)
 - Dashboard Tailwind : bleu→orange→rouge (risque), vert/rouge (PnL), **PWA** mobile enrichi
 
 ## Démarrage Docker (Coolify / local)

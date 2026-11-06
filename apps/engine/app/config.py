@@ -116,7 +116,11 @@ class BotParams(BaseModel):
     stop_loss_pct: float = Field(default=0.009, ge=0, le=1)
     # Concentrate capital on fewer, better lines (~15% equity max).
     max_position_pct: float = Field(default=0.15, gt=0, le=1)
-    risk_per_trade_pct: float = Field(default=0.012, gt=0, le=0.05)
+    # Hard ceiling 2% capital/trade (AI / Kelly cannot raise this).
+    risk_per_trade_pct: float = Field(default=0.012, gt=0, le=0.02)
+    # Paper order-book depth walk (lot 8); off keeps classic slip-only fills.
+    order_book_depth_enabled: bool = False
+    order_book_depth_levels: int = Field(default=5, ge=1, le=20)
     atr_stop_mult: float = Field(default=1.35, ge=1.0, le=4.0)
     reward_risk: float = Field(default=2.0, ge=1.0, le=5.0)
     min_hold_min: int = Field(default=3, ge=0, le=24 * 60)

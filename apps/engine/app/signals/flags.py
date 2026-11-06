@@ -59,6 +59,20 @@ def flags_from_env(getenv) -> SignalFeatureFlags:
     return SignalFeatureFlags(**{k: _truthy(k) for k in FLAG_ENV_KEYS})
 
 
+def env_flag_overrides(getenv) -> dict[str, bool]:
+    """Return only keys whose env var is explicitly set (non-empty)."""
+    out: dict[str, bool] = {}
+    for key, env_key in FLAG_ENV_KEYS.items():
+        raw = getenv(env_key)
+        if raw is None:
+            continue
+        text = str(raw).strip()
+        if text == "":
+            continue
+        out[key] = text.lower() in {"1", "true", "yes", "on"}
+    return out
+
+
 class HardRiskCaps(BaseModel):
     """Non-negotiable risk caps — not modifiable by signal AI."""
 

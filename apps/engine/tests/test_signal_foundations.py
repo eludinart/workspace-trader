@@ -68,11 +68,20 @@ def test_observation_ok_when_as_of_le_ingested():
     assert obs.as_of <= obs.ingested_at
 
 
-def test_oos_never_allows_activation():
-    pnls = [1.0] * 100 + [-0.5] * 50
-    report = evaluate_oos(pnls, min_holdout=10)
+def test_oos_refuses_when_holdout_too_small():
+    pnls = [1.0] * 20
+    report = evaluate_oos(pnls, min_holdout=30)
     assert report.activation_allowed is False
-    assert "activation" in report.activation_block_reason.lower() or "validation" in report.activation_block_reason.lower()
+    assert "holdout" in report.activation_block_reason.lower()
+
+
+def test_oos_allows_when_thresholds_met():
+    # 70% train / 30% holdout; holdout all wins → win_rate=1, avg>0
+    pnls = [1.0] * 70 + [1.0] * 40
+    report = evaluate_oos(pnls, min_holdout=30, min_holdout_win_rate=0.55)
+    assert report.split.holdout_size >= 30
+    assert report.activation_allowed is True
+    assert report.activation_block_reason == ""
 
 
 def test_stubs_disabled_expose_reason():

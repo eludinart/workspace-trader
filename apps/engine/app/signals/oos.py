@@ -64,8 +64,14 @@ def evaluate_oos(
     train_ratio: float = 0.7,
     min_holdout: int = 30,
     min_holdout_win_rate: float = 0.55,
+    min_holdout_avg: float = 0.0,
 ) -> OosReport:
-    """Compute train/holdout metrics. Never sets activation_allowed True here."""
+    """Compute train/holdout metrics.
+
+    ``activation_allowed`` is True only when holdout size, win-rate and avg PnL
+    clear thresholds. Callers still choose shadow vs enforce for confluence/MTF.
+    Kelly sizing has a separate, stricter gate (sample + this OOS).
+    """
     split = split_indices(len(trade_pnls), train_ratio)
     train = list(trade_pnls[: split.train_size])
     hold = list(trade_pnls[split.train_size :])
@@ -81,10 +87,15 @@ def evaluate_oos(
             f"holdout n={split.holdout_size} < min_holdout={min_holdout}"
         )
     wr = float(report.holdout_metrics.get("win_rate") or 0.0)
+    avg = float(report.holdout_metrics.get("avg") or 0.0)
     if split.holdout_size > 0 and wr < min_holdout_win_rate:
         reasons.append(f"holdout win_rate={wr:.2f} < {min_holdout_win_rate:.2f}")
-    reasons.append("manual validation required before activation")
-    report.activation_block_reason = "; ".join(reasons)
-    # Hard rule for this harness: never auto-activate.
-    report.activation_allowed = False
+    if split.holdout_size > 0 and avg < min_holdout_avg:
+        reasons.append(f"holdout avg={avg:.4f} < {min_holdout_avg:.4f}")
+    if reasons:
+        report.activation_block_reason = "; ".join(reasons)
+        report.activation_allowed = False
+    else:
+        report.activation_allowed = True
+        report.activation_block_reason = ""
     return report
