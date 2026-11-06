@@ -1,4 +1,4 @@
-/** Pure helpers for PaperSessionChart (domain fit + signed curve segments). */
+/** Pure helpers for PaperSessionChart (time domain + signed curve segments). */
 
 export type PaperTimeRange =
   | "1h"
@@ -24,10 +24,8 @@ export function rangeDeltaMs(range: PaperTimeRange): number | null {
 }
 
 /**
- * X domain for the selected range.
- * When stored samples only cover a short recent slice of a long window (e.g. 20 min
- * of data on a 6h range), snap start forward so the series fills the plot instead
- * of sitting compressed on the right edge.
+ * X domain always follows the selected time scale so range buttons change the chart.
+ * Sparse history stays right-aligned inside that window (no auto-zoom to data).
  */
 export function domainForRange(
   range: PaperTimeRange,
@@ -44,36 +42,11 @@ export function domainForRange(
     start = sessionStartedAt ?? series[0]?.t ?? end - 3600_000;
     start = Math.min(start, end - 60_000);
   } else if (series.length) {
-    start = Math.min(series[0].t, end - 60_000);
+    start = series[0].t;
+    if (end - start < 60_000) start = end - 60_000;
   } else {
     start = end - 3600_000;
   }
-
-  if (!series.length) return { start, end };
-
-  const dataStart = series[0].t;
-  const dataEnd = series[series.length - 1].t;
-  const windowSpan = Math.max(1, end - start);
-  const dataSpan = Math.max(0, dataEnd - dataStart);
-
-  // Single point: keep a readable local window around it.
-  if (series.length === 1) {
-    const half = Math.min(delta ?? 3600_000, 10 * 60_000) / 2;
-    return {
-      start: Math.max(start, dataStart - half),
-      end: Math.max(end, dataStart + Math.max(30_000, half * 0.25)),
-    };
-  }
-
-  // Sparse relative to the selected window → zoom to data (keep live end).
-  const fillsWindow = dataSpan >= windowSpan * 0.45 && dataStart <= start + windowSpan * 0.12;
-  if (!fillsWindow) {
-    const pad = Math.max(20_000, dataSpan * 0.06);
-    const fittedStart = dataStart - pad;
-    // Never expand past the nominal range start (don't invent older empty time).
-    return { start: Math.max(start, fittedStart), end };
-  }
-
   return { start, end };
 }
 

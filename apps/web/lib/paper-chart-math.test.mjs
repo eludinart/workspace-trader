@@ -45,19 +45,23 @@ const { domainForRange, splitSignedSegments, pathSkippingInvalid, signedAreaPath
 const now = Date.parse("2026-11-06T13:29:00Z");
 const hour = 3600_000;
 
-// Sparse 6h window: ~25 min of samples near `now` must not leave 85% empty left.
+// Sparse history must still honor the selected window (time-scale buttons).
 {
   const series = [];
   for (let i = 0; i < 30; i += 1) {
     series.push({ t: now - 25 * 60_000 + i * 50_000 });
   }
-  const domain = domainForRange("6h", null, series, now);
-  const span = domain.end - domain.start;
-  const dataStart = series[0].t;
-  assert.ok(span < 2 * hour, `expected fitted span < 2h, got ${span / hour}h`);
-  assert.ok(domain.start <= dataStart, "start should be at/before first sample");
-  assert.ok(domain.start > now - 6 * hour + hour, "should snap forward vs full 6h start");
-  assert.equal(domain.end, now);
+  const d1h = domainForRange("1h", null, series, now);
+  const d6h = domainForRange("6h", null, series, now);
+  const d1w = domainForRange("1w", null, series, now);
+  assert.equal(d1h.start, now - hour);
+  assert.equal(d1h.end, now);
+  assert.equal(d6h.start, now - 6 * hour);
+  assert.equal(d6h.end, now);
+  assert.equal(d1w.start, now - 7 * 24 * hour);
+  assert.equal(d1w.end, now);
+  assert.ok(d6h.end - d6h.start > d1h.end - d1h.start, "6h domain wider than 1h");
+  assert.ok(d1w.end - d1w.start > d6h.end - d6h.start, "1w domain wider than 6h");
 }
 
 // Full 6h of data keeps nominal window.
@@ -68,6 +72,15 @@ const hour = 3600_000;
   }
   const domain = domainForRange("6h", null, series, now);
   assert.equal(domain.start, now - 6 * hour);
+  assert.equal(domain.end, now);
+}
+
+// Session uses sessionStartedAt even when samples are shorter.
+{
+  const started = now - 3 * hour;
+  const series = [{ t: now - 20 * 60_000 }, { t: now }];
+  const domain = domainForRange("session", started, series, now);
+  assert.equal(domain.start, started);
   assert.equal(domain.end, now);
 }
 

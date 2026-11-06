@@ -136,11 +136,17 @@ function fmtPct(v: number, digits = 2): string {
 }
 
 function windowLabel(range: PaperTimeRange, spanMs: number): string {
+  // Fixed ranges: always show the selected scale (never derive from fitted/data span).
+  if (range !== "session" && range !== "all") {
+    return RANGE_OPTIONS.find((o) => o.id === range)?.label ?? range;
+  }
+  const opt = RANGE_OPTIONS.find((o) => o.id === range)?.label ?? range;
   const hours = spanMs / 3600_000;
-  if (hours < 36) return `${Math.max(1, Math.round(hours))} h`;
+  if (hours < 1.5) return `${opt} (${Math.max(1, Math.round(spanMs / 60_000))} min)`;
+  if (hours < 36) return `${opt} (${Math.max(1, Math.round(hours))} h)`;
   const days = hours / 24;
-  if (days < 40) return `${Math.round(days)} j`;
-  return RANGE_OPTIONS.find((o) => o.id === range)?.label ?? range;
+  if (days < 40) return `${opt} (${Math.round(days)} j)`;
+  return opt;
 }
 
 /** Drop hydrate glitches that collapse the Y axis to 0. */
@@ -541,8 +547,6 @@ export function PaperSessionChart({
 
     const dataSpan =
       plotRaw.length >= 2 ? plotRaw[plotRaw.length - 1].t - plotRaw[0].t : 0;
-    const fitted =
-      plotRaw.length >= 2 && dataSpan < span * 0.45;
 
     return {
       equityPts,
@@ -566,8 +570,7 @@ export function PaperSessionChart({
       pointCount: plotSeries.length,
       rawCount: plotRaw.length,
       hasSeries: plotSeries.length >= 1,
-      sparse: plotRaw.length < 3 || dataSpan < span * 0.2,
-      fitted,
+      sparse: plotRaw.length < 3 || dataSpan < span * 0.25,
       pnlPositive: chartPnl >= 0,
     };
   }, [
@@ -627,11 +630,10 @@ export function PaperSessionChart({
           </div>
           <p className="mt-0.5 text-xs text-muted">
             Fenêtre <span className="text-slate-300">{windowLabel(range, span)}</span>
-            {geometry.fitted ? " · zoom auto sur l’historique dispo" : ""}
             {" · "}
             equity {layers.cash ? "+ cash" : ""}
             {breakEven != null ? ` · seuil ${money(breakEven)} $` : ""}
-            {geometry.sparse && !geometry.fitted ? " · données encore courtes sur cette échelle" : ""}
+            {geometry.sparse ? " · données encore courtes sur cette échelle" : ""}
           </p>
         </div>
         <div
