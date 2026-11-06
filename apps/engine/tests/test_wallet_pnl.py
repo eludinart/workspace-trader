@@ -58,7 +58,7 @@ def test_partial_sell_proportional_cost_basis():
     assert abs(t2.realized_pnl - (-6.0)) < 1e-9
 
 
-def test_incomplete_legacy_trade_not_invented():
+def test_legacy_sell_shows_recorded_pnl_without_invented_ref():
     legacy = Trade(
         id="old",
         symbol="BTC-USD",
@@ -73,10 +73,34 @@ def test_incomplete_legacy_trade_not_invented():
         cost_basis_closed=None,
     )
     ann = annotate_trade_for_display(legacy)
-    assert ann["display_kind"] == "incomplete"
-    assert ann["display_amount"] is None
-    assert "incomplètes" in ann["amount_label"]
-    assert ann["tone"] == "muted"
+    assert ann["display_kind"] == "realized"
+    assert ann["display_amount"] == 5.0
+    assert ann["display_pct"] is None
+    assert ann["badge"] == "winner"
+    assert ann["tone"] == "gain"
+    assert "réf. incomplète" in ann["amount_label"]
+    assert ann.get("reference_price") is None
+
+
+def test_legacy_sell_loss_badge_without_pct():
+    legacy = Trade(
+        id="old-loss",
+        symbol="NEX-USD",
+        side="sell",
+        qty=1.0,
+        price=1e-6,
+        fee=0.09,
+        ts=datetime.now(timezone.utc),
+        realized_pnl=-3.175,
+        meta_complete=False,
+        avg_entry_ref=None,
+        cost_basis_closed=None,
+    )
+    ann = annotate_trade_for_display(legacy)
+    assert ann["badge"] == "loser"
+    assert ann["tone"] == "loss"
+    assert ann["display_pct"] is None
+    assert ann["display_amount"] == -3.175
 
 
 def test_net_pnl_if_closed_matches_wallet_cost_basis():

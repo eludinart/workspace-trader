@@ -170,31 +170,35 @@ def annotate_trade_for_display(trade: Trade) -> dict[str, Any]:
         }
 
     if side == "sell":
-        if (
-            not trade.meta_complete
-            or trade.avg_entry_ref is None
-            or trade.cost_basis_closed is None
-        ):
-            return {
-                **base,
-                "display_kind": "incomplete",
-                "display_amount": None,
-                "display_pct": None,
-                "badge": None,
-                "badge_label": "Non calculable",
-                "amount_label": "Non calculable — données incomplètes",
-                "reference_label": None,
-                "tone": "muted",
-            }
         net = float(trade.realized_pnl)
-        basis = float(trade.cost_basis_closed)
-        pct = (net / basis) * 100.0 if basis > 0 else None
         if net > 0:
             badge, tone, label = "winner", "gain", "Gagnant"
         elif net < 0:
             badge, tone, label = "loser", "loss", "Perdant"
         else:
             badge, tone, label = "flat", "neutral", "Équilibre"
+
+        complete = (
+            trade.meta_complete
+            and trade.avg_entry_ref is not None
+            and trade.cost_basis_closed is not None
+        )
+        if not complete:
+            # Stored fill PnL is not invented — show it without % / entry ref.
+            return {
+                **base,
+                "display_kind": "realized",
+                "display_amount": net,
+                "display_pct": None,
+                "badge": badge,
+                "badge_label": label,
+                "amount_label": "P&L enregistré — réf. incomplète",
+                "reference_label": None,
+                "tone": tone,
+            }
+
+        basis = float(trade.cost_basis_closed)
+        pct = (net / basis) * 100.0 if basis > 0 else None
         ref_ts = trade.reference_ts.isoformat() if trade.reference_ts else None
         return {
             **base,

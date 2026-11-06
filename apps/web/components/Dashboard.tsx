@@ -1248,7 +1248,7 @@ export function Dashboard() {
           <section className="card">
             <h2 className="mb-2 text-lg font-medium">Historique paper</h2>
             <p className="mb-2 text-xs text-muted">
-              Vente = P&L net quote · achat = investi · gris si données incomplètes (pas de P&L inventé).
+              Vente = P&L net · achat = investi · legacy vente : P&L enregistré sans % / réf. d’entrée.
             </p>
             <ul className="max-h-[28rem] space-y-2 overflow-auto text-sm">
               {trades.length === 0 ? (
