@@ -47,6 +47,7 @@ CREATE TABLE IF NOT EXISTS positions (
   stop_pct REAL,
   take_pct REAL,
   exit_meta TEXT NOT NULL DEFAULT '{}',
+  cost_basis REAL,
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -59,7 +60,28 @@ CREATE TABLE IF NOT EXISTS trades (
   fee REAL NOT NULL DEFAULT 0,
   ts TEXT NOT NULL,
   realized_pnl REAL NOT NULL DEFAULT 0,
-  note TEXT
+  note TEXT,
+  decision_ts TEXT,
+  decision_price REAL,
+  latency_ms INTEGER,
+  slip_bps REAL,
+  impact_bps REAL,
+  invested_quote REAL,
+  avg_entry_ref REAL,
+  cost_basis_closed REAL,
+  reference_ts TEXT,
+  meta_complete INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS signal_observations (
+  id TEXT PRIMARY KEY,
+  kind TEXT NOT NULL,
+  symbol TEXT NOT NULL,
+  as_of TEXT NOT NULL,
+  ingested_at TEXT NOT NULL,
+  payload TEXT NOT NULL DEFAULT '{}',
+  confidence_tier TEXT NOT NULL DEFAULT 'hypothesis',
+  source TEXT NOT NULL DEFAULT 'stub'
 );
 
 CREATE TABLE IF NOT EXISTS journal (
