@@ -24,6 +24,7 @@ from app.db import get_conn
 from app.lease import read_lease
 from app.migrate import run_migrations
 from app.news.models import NewsCategory
+from app.push.vapid import vapid_public_key, web_push_status
 from app.runtime import LeaseLost, TradingRuntime
 from app.signals.confluence import score_confluence
 from app.signals.kelly import evaluate_kelly
@@ -413,14 +414,29 @@ def get_signal_stubs(symbol: str | None = None) -> dict[str, Any]:
             "note": "async journal-only; never mutates PnL/positions; off in backtest pretrade",
         },
         "web_push": {
+            **web_push_status(),
             "enabled": flags.web_push_enabled,
-            "note": "VAPID via env only; no Telegram; HTTPS domain required",
         },
         "order_book_depth": {
             "enabled": bool(getattr(runtime.params, "order_book_depth_enabled", False)),
             "levels": int(getattr(runtime.params, "order_book_depth_levels", 5) or 5),
             "label": "simulated_book:hypothesis",
         },
+    }
+
+
+@app.get("/push/vapid-public")
+def get_vapid_public() -> dict[str, Any]:
+    """Public VAPID only — never returns the private key."""
+    flags = runtime.signal_flags()
+    status = web_push_status()
+    pub = vapid_public_key()
+    return {
+        "enabled": bool(flags.web_push_enabled),
+        "public_key": pub if flags.web_push_enabled else None,
+        "public_key_configured": status["public_key_configured"],
+        "private_key_configured": status["private_key_configured"],
+        "note": status["note"],
     }
 
 

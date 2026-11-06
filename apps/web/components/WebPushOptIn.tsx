@@ -4,7 +4,8 @@ import { useCallback, useEffect, useState } from "react";
 
 /**
  * Web Push foundations (point 19). Permission must be explicit.
- * VAPID public key from NEXT_PUBLIC_VAPID_PUBLIC_KEY only — never private keys in repo.
+ * Public VAPID fetched at runtime from /api/engine/push/vapid-public.
+ * Never private keys in repo or client bundle.
  * No Telegram.
  */
 export function WebPushOptIn() {
@@ -43,19 +44,41 @@ export function WebPushOptIn() {
         return;
       }
       setStatus("granted");
-      const vapid = process.env.NEXT_PUBLIC_VAPID_PUBLIC_KEY || "";
+
+      const res = await fetch("/api/engine/push/vapid-public", { cache: "no-store" });
+      if (!res.ok) {
+        setDetail("Impossible de lire la clé VAPID publique (API).");
+        return;
+      }
+      const json = (await res.json()) as {
+        enabled?: boolean;
+        public_key?: string | null;
+        private_key_configured?: boolean;
+      };
+      if (!json.enabled) {
+        setDetail("Web Push désactivé côté serveur (WEB_PUSH_ENABLED).");
+        return;
+      }
+      const vapid = String(json.public_key || "").trim();
       if (!vapid) {
         setDetail(
-          "Permission OK — configure NEXT_PUBLIC_VAPID_PUBLIC_KEY (HTTPS + domaine public). Clé privée côté serveur uniquement.",
+          "Permission OK — clé publique VAPID absente. Pose VAPID_PUBLIC_KEY / VAPID_PRIVATE_KEY en Coolify.",
         );
         return;
+      }
+      if (!json.private_key_configured) {
+        setDetail("Clé publique OK mais clé privée absente côté serveur — abonnement incomplet.");
       }
       const reg = await navigator.serviceWorker.ready;
       await reg.pushManager.subscribe({
         userVisibleOnly: true,
         applicationServerKey: urlBase64ToUint8Array(vapid),
       });
-      setDetail("Abonnement push enregistré (VAPID public).");
+      setDetail(
+        json.private_key_configured
+          ? "Abonnement push enregistré (VAPID)."
+          : "Abonnement enregistré — complète VAPID_PRIVATE_KEY pour l’envoi serveur.",
+      );
     } catch (err) {
       setStatus("error");
       setDetail(err instanceof Error ? err.message : "Erreur push");
@@ -67,7 +90,7 @@ export function WebPushOptIn() {
       <p className="font-medium text-slate-200">Alertes Web Push (PWA / Samsung)</p>
       <p className="mt-1 text-xs text-muted">{detail}</p>
       <p className="mt-1 text-[10px] text-muted">
-        Pas de Telegram. HTTPS requis. VAPID via env only.
+        Pas de Telegram. HTTPS requis. VAPID via env Coolify only.
       </p>
       <button
         type="button"

@@ -8,6 +8,9 @@ services:
     environment:
       - NODE_ENV=production
       - ENGINE_URL=http://engine:8000
+      # Public key optional at runtime via engine API; keep for build-time if set.
+      - NEXT_PUBLIC_VAPID_PUBLIC_KEY=${NEXT_PUBLIC_VAPID_PUBLIC_KEY:-}
+      - WEB_PUSH_ENABLED=${WEB_PUSH_ENABLED:-false}
     depends_on:
       - engine
     restart: unless-stopped
@@ -28,6 +31,11 @@ services:
       - SMTP_PORT=${SMTP_PORT:-587}
       - SMTP_USER=${SMTP_USER:-}
       - SMTP_PASSWORD=${SMTP_PASSWORD:-}
+      - WEB_PUSH_ENABLED=${WEB_PUSH_ENABLED:-false}
+      - VAPID_PUBLIC_KEY=${VAPID_PUBLIC_KEY:-}
+      - VAPID_PRIVATE_KEY=${VAPID_PRIVATE_KEY:-}
+      - VAPID_SUBJECT=${VAPID_SUBJECT:-mailto:ops@eludein.art}
+      - NEXT_PUBLIC_VAPID_PUBLIC_KEY=${NEXT_PUBLIC_VAPID_PUBLIC_KEY:-}
     volumes:
       - engine_data:/app/data
     restart: unless-stopped
@@ -45,6 +53,10 @@ services:
       - SMTP_PORT=${SMTP_PORT:-587}
       - SMTP_USER=${SMTP_USER:-}
       - SMTP_PASSWORD=${SMTP_PASSWORD:-}
+      - WEB_PUSH_ENABLED=${WEB_PUSH_ENABLED:-false}
+      - VAPID_PUBLIC_KEY=${VAPID_PUBLIC_KEY:-}
+      - VAPID_PRIVATE_KEY=${VAPID_PRIVATE_KEY:-}
+      - VAPID_SUBJECT=${VAPID_SUBJECT:-mailto:ops@eludein.art}
     volumes:
       - engine_data:/app/data
     restart: unless-stopped
