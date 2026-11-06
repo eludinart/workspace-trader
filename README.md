@@ -22,14 +22,16 @@ Architecture inspirée de frameworks modulaires type Hummingbot (connectors / st
 
 ## Fonctionnalités
 
-- Wallet paper : cash, positions, PnL, **frais** + **slippage**
+- Wallet paper : cash, positions, PnL, **frais** + **slippage** (+ latence simulée, impact optionnel off)
+- Historic paper : P&L réalisé net par vente / montant investi à l’achat (pas de P&L inventé sur données incomplètes)
 - Données **Coinbase** (API publique, lecture seule)
 - Stratégie **XGBoost v1** (RSI, MACD, volumes, …) + score de confiance
 - **Journal de décision** (features + explication)
 - **Backtest** historique Coinbase (PnL, win rate, max drawdown)
 - **Kill switch** manuel + auto (perte / drawdown)
-- Alertes **Telegram** optionnelles
-- Dashboard Tailwind : bleu→orange→rouge (risque), vert/rouge (PnL), **PWA**
+- Alertes **Web Push** PWA (VAPID env) — Telegram présent mais non recommandé
+- Stubs signaux 14–21 derrière flags **off** par défaut (`/signals/stubs`, `/signals/oos`)
+- Dashboard Tailwind : bleu→orange→rouge (risque), vert/rouge (PnL), **PWA** mobile enrichi
 
 ## Démarrage Docker (Coolify / local)
 
@@ -43,7 +45,7 @@ docker compose up --build
 
 > Ports **3100 / 8100** pour ne pas collisionner avec Korymb (souvent sur 3000).
 
-Variables optionnelles : voir `.env.example` (`TELEGRAM_BOT_TOKEN`, SMTP…).
+Variables optionnelles : voir `.env.example` (SMTP, VAPID, flags `SIGNAL_*` tous `false`).
 
 ## Dev local
 
@@ -75,6 +77,8 @@ npm run dev
 | GET | `/market/candles` | Historique OHLCV |
 | GET | `/signals` | Dernier signal IA |
 | GET | `/journal` | Journal de décision |
+| GET | `/trades` | Fills annotés (P&L / investi) |
+| GET | `/signals/flags` `/signals/stubs` `/signals/oos` | Flags + stubs 14–21 + harness OOS |
 | PUT | `/params` | Paramètres bot / modèle |
 | PUT | `/alerts/params` | Alertes |
 | POST | `/backtest` | Backtest `{symbol,start,end}` |
@@ -86,7 +90,8 @@ npm run dev
 
 - Mode **paper** uniquement pour l’instant
 - Pas de clés exchange en écriture
-- Token Telegram via env / formulaire (masqué à la relecture)
+- VAPID : clé **publique** côté client, clé **privée** uniquement en secret env (jamais dans le repo)
+- Flags signaux / Web Push / post-trade : **off** jusqu’à OK explicite
 
 ## Suite possible
 
