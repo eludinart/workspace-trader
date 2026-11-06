@@ -11,7 +11,7 @@ from app.config import AlertParams, BotParams
 from app.events import EventBus
 from app.lease import read_lease
 from app.execution import OrderPlan, buy_spend, cooldown_active, plan_protective, plan_signal
-from app.fill_model import impact_bps_for_notional, quote_fill
+from app.fill_model import impact_bps_for_notional, quote_fill, walk_book_fill
 from app.journal import DecisionJournal
 from app.market.coinbase import CoinbaseClient
 from app.narrative import decision_narrative, format_other_exits, thresholds_from_detail
@@ -28,7 +28,12 @@ from app.risk import (
     sell_is_net_positive,
 )
 from app.signals.flags import SignalFeatureFlags
+from app.signals.gates import evaluate_entry_gates
+from app.signals.kelly import evaluate_kelly
+from app.signals.oos import evaluate_oos
+from app.signals.passive_wake import evaluate_passive_wake
 from app.signals.post_trade import run_post_trade_review
+from app.signals.risk_caps import HARD_RISK_PER_TRADE_PCT, clamp_risk_per_trade_pct
 from app.strategy.features import build_feature_frame
 from app.strategy.xgboost_strategy import SignalResult, XGBoostStrategy
 from app.trading_style import apply_style_preset, normalize_style, scan_gates
@@ -707,6 +712,15 @@ class TradingRuntime:
     def _build_fill_quote(self, side: str, decision_price: float, *, notional: float) -> Any:
         if self.params.latency_wall_clock and self.params.latency_ms > 0:
             time.sleep(self.params.latency_ms / 1000.0)
+        if bool(getattr(self.params, "order_book_depth_enabled", False)):
+            return walk_book_fill(
+                side,
+                decision_price,
+                notional,
+                latency_ms=int(self.params.latency_ms),
+                depth_levels=int(getattr(self.params, "order_book_depth_levels", 5) or 5),
+                base_slip_bps=float(self.params.slippage_bps),
+            )
         fill_mid = decision_price
         # After simulated latency, refresh mark when possible (adverse path).
         # Caller may pass a symbol via prices; we keep mid unless wall-clock refreshed.
@@ -724,6 +738,33 @@ class TradingRuntime:
             impact_bps=impact,
             fill_mid=fill_mid,
         )
+
+    def _closed_sell_pnls(self) -> list[float]:
+        return [
+            float(t.realized_pnl)
+            for t in self.wallet.trades
+            if t.side == "sell" and getattr(t, "meta_complete", False)
+        ]
+
+    def _effective_risk_frac(self) -> float:
+        """Risk per trade clamped to hard 2% — Kelly never raises the ceiling."""
+        base = clamp_risk_per_trade_pct(float(self.params.risk_per_trade_pct))
+        flags = self.signal_flags()
+        if not flags.kelly_enabled:
+            return base
+        pnls = self._closed_sell_pnls()
+        oos = evaluate_oos(pnls)
+        kelly = evaluate_kelly(
+            pnls,
+            enabled=True,
+            oos_activation_allowed=bool(oos.activation_allowed),
+            allow_sizing=False,  # prod stays eval-only until sample+OOS explicitly unlocked
+        )
+        if kelly.active and kelly.suggested_size_mult:
+            # Defensive path — currently unreachable while allow_sizing=False.
+            scaled = base * float(kelly.suggested_size_mult)
+            return clamp_risk_per_trade_pct(scaled)
+        return base
 
     def _maybe_post_trade_review(self, trade: Trade) -> None:
         if trade.side != "sell":
@@ -1022,6 +1063,19 @@ class TradingRuntime:
         if plan.side == "buy":
             if not self._symbol_tradeable(symbol, price):
                 return None, OrderPlan("hold", 0.0, "budget", "hold:illiquid")
+            gate = evaluate_entry_gates(
+                confluence_enabled=bool(self.params.confluence_enabled),
+                mtf_enabled=bool(self.params.mtf_enabled),
+                features=signal.features,
+                intended_side="buy",
+                candles=candles,
+                trade_pnls=self._closed_sell_pnls(),
+            )
+            if gate.shadow:
+                logger.info("entry_gate shadow %s: %s", symbol, gate.reason)
+            if gate.blocked:
+                logger.info("entry_gate block %s: %s", symbol, gate.reason)
+                return None, OrderPlan("hold", 0.0, "signal_gate", f"hold:gate:{gate.reason[:48]}")
             open_r = portfolio_open_risk_r(
                 self.wallet.positions,
                 self.prices_map(),
@@ -1043,12 +1097,14 @@ class TradingRuntime:
             )
             # Slip-only provisional fill for sizing (no wall-clock sleep / impact).
             fill = self._apply_slippage("buy", price)
+            risk_frac = self._effective_risk_frac()
+            assert risk_frac <= HARD_RISK_PER_TRADE_PCT + 1e-12
             risk_spend = risk_position_spend(
                 equity,
                 self.wallet.cash,
                 fill,
                 levels.stop_pct,
-                risk_frac=float(self.params.risk_per_trade_pct),
+                risk_frac=risk_frac,
                 max_position_pct=float(self.params.max_position_pct),
             )
             soft_cap = buy_spend(
@@ -1169,6 +1225,34 @@ class TradingRuntime:
             "ts": self.last_tick_at.isoformat(),
             "from_news": any(h.get("symbol") == symbol for h in self.universe.news_hits),
         }
+
+        # Passiveive wake (lot 4): deterministic threshold; journal when AI should wake.
+        if self.params.passive_wake_enabled:
+            move = None
+            try:
+                if candles is not None and len(candles) >= 2 and "close" in candles.columns:
+                    c0 = float(candles["close"].iloc[-2])
+                    c1 = float(candles["close"].iloc[-1])
+                    if c0 > 0:
+                        move = (c1 - c0) / c0
+            except Exception:  # noqa: BLE001
+                move = None
+            wake = evaluate_passive_wake(enabled=True, move_pct=move)
+            if wake.should_wake_ai:
+                logger.info("passive_wake %s value=%s", symbol, wake.value)
+                self.journal.add(
+                    symbol=symbol,
+                    action="wake",
+                    price=float(price),
+                    qty=0.0,
+                    trade_id=None,
+                    confidence=0.0,
+                    features={},
+                    top_features=[],
+                    explanation=wake.reason,
+                    note="passive_wake",
+                    narrative=wake.reason,
+                )
 
         if not self.killed:
             self.alerts.on_strong_signal(symbol, signal.action, signal.confidence)
@@ -1337,6 +1421,10 @@ class TradingRuntime:
             clean.pop("trading_style", None)
         allowed = set(BotParams.model_fields)
         data.update({k: v for k, v in clean.items() if k in allowed})
+        if "risk_per_trade_pct" in data:
+            data["risk_per_trade_pct"] = clamp_risk_per_trade_pct(
+                float(data["risk_per_trade_pct"])
+            )
         if style_requested:
             data["trading_style"] = normalize_style(data.get("trading_style"))
         new_params = BotParams(**data)

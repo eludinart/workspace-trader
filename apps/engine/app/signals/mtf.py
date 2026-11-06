@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Literal
 
+import pandas as pd
+
 Bias = Literal["bull", "bear", "neutral", "unknown"]
 
 
@@ -49,6 +51,48 @@ def _bias_from_change(change: float | None) -> Bias:
     if change < -0.002:
         return "bear"
     return "neutral"
+
+
+def _pct_change_over(closes: pd.Series, bars: int) -> float | None:
+    if closes is None or len(closes) <= bars:
+        return None
+    a = float(closes.iloc[-1])
+    b = float(closes.iloc[-(bars + 1)])
+    if b == 0:
+        return None
+    return (a - b) / b
+
+
+def tf_changes_from_candles(
+    candles: Any,
+    *,
+    bar_seconds: int | None = None,
+) -> dict[str, float | None]:
+    """Derive approx 15m / 4h / 1d returns from a single candle frame.
+
+    When bar size is unknown, assume hourly (3600s) — Coinbase default for engine.
+    Returns None for a TF when not enough bars exist (gate treats as incomplete).
+    """
+    if candles is None:
+        return {"15m": None, "4h": None, "1d": None}
+    if isinstance(candles, pd.DataFrame):
+        df = candles
+    else:
+        try:
+            df = pd.DataFrame(candles)
+        except Exception:  # noqa: BLE001
+            return {"15m": None, "4h": None, "1d": None}
+    if "close" not in df.columns or len(df) < 2:
+        return {"15m": None, "4h": None, "1d": None}
+    closes = df["close"].astype(float)
+    sec = int(bar_seconds or 3600)
+    # bars needed for each horizon
+    need = {
+        "15m": max(1, int(round(900 / sec))),
+        "4h": max(1, int(round(14_400 / sec))),
+        "1d": max(1, int(round(86_400 / sec))),
+    }
+    return {k: _pct_change_over(closes, n) for k, n in need.items()}
 
 
 def evaluate_mtf_gate(

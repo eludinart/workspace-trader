@@ -23,7 +23,8 @@ class KellyEval:
             "sample_n": self.sample_n,
             "reason": self.reason,
             "suggested_size_mult": self.suggested_size_mult,
-            "applies_to_sizing": False,  # hard: eval-only until explicitly wired
+            # True only when active sizing path is deliberately unlocked + OOS OK.
+            "applies_to_sizing": bool(self.active and self.suggested_size_mult),
         }
 
 
@@ -35,7 +36,15 @@ def evaluate_kelly(
     kelly_fraction: float = 0.25,
     vol_ratio_vs_baseline: float | None = None,
     max_position_corr: float | None = None,
+    oos_activation_allowed: bool = False,
+    allow_sizing: bool = False,
 ) -> KellyEval:
+    """Fractional Kelly.
+
+    Sizing stays OFF unless ``allow_sizing`` AND ``oos_activation_allowed`` AND
+    sample ≥ min_sample. Even then ``suggested_size_mult`` is advisory — callers
+    must still clamp risk to HARD_RISK_PER_TRADE_PCT (2%).
+    """
     n = len(trade_pnls)
     if not enabled:
         return KellyEval(
@@ -76,12 +85,30 @@ def evaluate_kelly(
     if max_position_corr is not None and max_position_corr > 0.5:
         frac *= 0.5
         reasons.append("corrélation positions > 0.5 → fraction réduite")
-    reasons.append("mode évaluation only — ne change pas la taille")
+    can_size = bool(allow_sizing and oos_activation_allowed and frac > 0)
+    if not can_size:
+        if not oos_activation_allowed:
+            reasons.append("OOS gate refusée — éval only, sizing inchangé")
+        elif not allow_sizing:
+            reasons.append("mode évaluation only — ne change pas la taille")
+        else:
+            reasons.append("fraction≤0 — sizing inchangé")
+        return KellyEval(
+            enabled=True,
+            active=False,
+            fraction=frac,
+            sample_n=n,
+            reason="; ".join(reasons),
+            suggested_size_mult=None,
+        )
+    # Advisory only: map fraction into a mild size mult ∈ [0.5, 1.0].
+    mult = max(0.5, min(1.0, 0.5 + frac))
+    reasons.append("sizing advisory — caller must clamp ≤2% risk/trade")
     return KellyEval(
         enabled=True,
-        active=False,  # never activates sizing from this module alone
+        active=True,
         fraction=frac,
         sample_n=n,
         reason="; ".join(reasons),
-        suggested_size_mult=None,
+        suggested_size_mult=mult,
     )

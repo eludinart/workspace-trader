@@ -17,6 +17,13 @@ POSSIBLE_SOURCES: dict[str, list[str]] = {
     "liquidations": ["Coinglass liquidation heatmaps", "exchange public liq feeds"],
 }
 
+# Chosen defaults for future wiring (documented; still stubs until API keys in Coolify).
+PREFERRED_SOURCES: dict[str, str] = {
+    "whales": "Whale Alert API",
+    "funding": "Coinglass",
+    "liquidations": "Coinglass liquidation heatmaps",
+}
+
 
 @dataclass(frozen=True)
 class OnchainStub:
@@ -32,6 +39,7 @@ class OnchainStub:
             "enabled": self.enabled,
             "label": self.label,
             "possible_sources": self.possible_sources,
+            "preferred_source": PREFERRED_SOURCES.get(self.kind),
             "observation": self.observation.to_dict() if self.observation else None,
         }
 
