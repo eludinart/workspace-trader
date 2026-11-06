@@ -7,6 +7,7 @@ import pandas as pd
 
 from app.config import BotParams
 from app.execution import buy_spend, cooldown_active, plan_protective, plan_signal
+from app.fill_model import impact_bps_for_notional, quote_fill
 from app.journal import DecisionJournal
 from app.market.coinbase import CoinbaseClient
 from app.strategy.xgboost_strategy import XGBoostStrategy
@@ -94,7 +95,27 @@ def run_backtest(
 
         trade = None
         note = ""
-        slip = params.slippage_bps / 10_000.0
+        latency_ms = int(getattr(params, "latency_ms", 0) or 0)
+        impact_on = bool(getattr(params, "order_impact_enabled", False))
+        impact_max = float(getattr(params, "impact_bps_max", 5.0) or 0.0)
+
+        def _fill(side: str, decision_mid: float, notional: float):
+            impact = impact_bps_for_notional(
+                notional,
+                enabled=impact_on,
+                equity=max(wallet.equity({symbol: close}), 1.0),
+                max_impact_bps=impact_max,
+            )
+            return quote_fill(
+                side,
+                decision_mid,
+                slip_bps=float(params.slippage_bps),
+                latency_ms=latency_ms,
+                impact_bps=impact,
+                fill_mid=decision_mid,
+                decision_ts=bar_ts,
+            )
+
         pos = wallet.get_position(symbol)
         if pos is not None:
             stop_plan = plan_protective(
@@ -113,14 +134,20 @@ def run_backtest(
                 protective = take_plan
                 raw_fill = pos.avg_entry * (1.0 + params.take_profit_pct)
             if protective is not None and raw_fill > 0:
-                fill = raw_fill * (1.0 - slip)
+                q = _fill("sell", raw_fill, pos.qty * raw_fill)
                 try:
                     trade = wallet.sell(
                         symbol,
                         qty=pos.qty,
-                        price=fill,
+                        price=q.fill_price,
                         fee_bps=params.fee_bps,
                         note=protective.note,
+                        decision_ts=q.decision_ts,
+                        decision_price=q.decision_price,
+                        latency_ms=q.latency_ms,
+                        slip_bps=q.slip_bps,
+                        impact_bps=q.impact_bps,
+                        ts=bar_ts,
                     )
                     note = protective.note
                 except ValueError:
@@ -150,7 +177,6 @@ def run_backtest(
             )
             note = plan.note
             if plan.side == "buy":
-                fill = close * (1.0 + slip)
                 spend = buy_spend(
                     wallet.cash,
                     equity,
@@ -158,32 +184,45 @@ def run_backtest(
                     params.position_size_pct,
                     params.max_position_pct,
                 )
+                q = _fill("buy", close, spend)
                 fee_mult = 1.0 + params.fee_bps / 10_000.0
-                if spend >= 10 and fill > 0:
-                    qty = spend / (fill * fee_mult)
+                if spend >= 10 and q.fill_price > 0:
+                    qty = spend / (q.fill_price * fee_mult)
                     try:
                         trade = wallet.buy(
                             symbol,
                             qty=qty,
-                            price=fill,
+                            price=q.fill_price,
                             fee_bps=params.fee_bps,
                             note=plan.note,
+                            decision_ts=q.decision_ts,
+                            decision_price=q.decision_price,
+                            latency_ms=q.latency_ms,
+                            slip_bps=q.slip_bps,
+                            impact_bps=q.impact_bps,
+                            ts=bar_ts,
                         )
                         last_buy_at = bar_ts
                     except ValueError:
                         trade = None
             elif plan.side == "sell" and pos is not None:
-                fill = close * (1.0 - slip)
                 qty = pos.qty * plan.sell_fraction
                 if pos.qty - qty < 1e-8:
                     qty = pos.qty
+                q = _fill("sell", close, qty * close)
                 try:
                     trade = wallet.sell(
                         symbol,
                         qty=qty,
-                        price=fill,
+                        price=q.fill_price,
                         fee_bps=params.fee_bps,
                         note=plan.note,
+                        decision_ts=q.decision_ts,
+                        decision_price=q.decision_price,
+                        latency_ms=q.latency_ms,
+                        slip_bps=q.slip_bps,
+                        impact_bps=q.impact_bps,
+                        ts=bar_ts,
                     )
                 except ValueError:
                     trade = None

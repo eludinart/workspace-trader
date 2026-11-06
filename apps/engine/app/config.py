@@ -94,6 +94,20 @@ class BotParams(BaseModel):
     auto_trade: bool = True
     fee_bps: float = Field(default=10.0, ge=0)
     slippage_bps: float = Field(default=5.0, ge=0)  # simulated adverse slippage
+    # Decision → fill latency (ms). Wall-clock sleep optional (off = record only).
+    latency_ms: int = Field(default=250, ge=0, le=5000)
+    latency_wall_clock: bool = False
+    order_impact_enabled: bool = False
+    impact_bps_max: float = Field(default=5.0, ge=0, le=50)
+    # Signal feature stubs — all false; see app.signals.flags
+    confluence_enabled: bool = False
+    mtf_enabled: bool = False
+    kelly_enabled: bool = False
+    onchain_enabled: bool = False
+    super_opp_enabled: bool = False
+    passive_wake_enabled: bool = False
+    post_trade_ai_enabled: bool = False
+    web_push_enabled: bool = False
     kill_switch_enabled: bool = True
     max_daily_loss_pct: float = Field(default=5.0, ge=0.1, le=100)
     max_drawdown_pct: float = Field(default=15.0, ge=0.1, le=100)
