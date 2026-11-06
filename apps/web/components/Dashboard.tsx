@@ -847,6 +847,7 @@ export function Dashboard() {
             cash={account?.cash ?? 0}
             positions={account?.open_count ?? account?.positions?.length ?? 0}
             pnl={pnl}
+            initialBalance={account?.initial_balance}
             live={live}
           />
         </div>
@@ -968,6 +969,7 @@ export function Dashboard() {
             cash={account?.cash ?? 0}
             positions={account?.open_count ?? account?.positions?.length ?? 0}
             pnl={pnl}
+            initialBalance={account?.initial_balance}
             live={live}
           />
         </div>

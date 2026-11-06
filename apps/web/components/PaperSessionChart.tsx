@@ -3,12 +3,23 @@
 import {
   useCallback,
   useEffect,
+  useId,
   useMemo,
   useRef,
   useState,
   type PointerEvent as ReactPointerEvent,
 } from "react";
 import { api, money, pnlClass } from "@/lib/engine";
+import {
+  areaPath,
+  domainForRange,
+  linePath,
+  pathSkippingInvalid,
+  rangeDeltaMs,
+  signedAreaPaths,
+  type PaperTimeRange,
+  type XY,
+} from "@/lib/paper-chart-math";
 
 export type PaperSample = {
   t: number;
@@ -19,22 +30,15 @@ export type PaperSample = {
   drawdownPct: number;
 };
 
-export type PaperTimeRange =
-  | "1h"
-  | "6h"
-  | "24h"
-  | "1d"
-  | "1w"
-  | "1mo"
-  | "1y"
-  | "session"
-  | "all";
+export type { PaperTimeRange };
 
 type PaperSessionChartProps = {
   equity: number;
   cash: number;
   positions: number;
   pnl: number;
+  /** Break-even equity (paper initial balance). Used for gain/loss coloring. */
+  initialBalance?: number;
   live?: boolean;
   maxPoints?: number;
 };
@@ -66,6 +70,9 @@ const COLORS = {
   cash: "#a78bfa",
   pnl: "#34d399",
   pnlNeg: "#f87171",
+  gainFill: "rgba(52,211,153,0.22)",
+  lossFill: "rgba(248,113,113,0.20)",
+  breakEven: "rgba(148,163,184,0.55)",
   positions: "#fbbf24",
   drawdown: "#fb7185",
   grid: "rgba(148,163,184,0.10)",
@@ -102,39 +109,11 @@ function loadLayers(): Record<SeriesKey, boolean> {
   }
 }
 
-function rangeDeltaMs(range: PaperTimeRange): number | null {
-  if (range === "1h") return 3600_000;
-  if (range === "6h") return 6 * 3600_000;
-  if (range === "24h" || range === "1d") return 24 * 3600_000;
-  if (range === "1w") return 7 * 24 * 3600_000;
-  if (range === "1mo") return 30 * 24 * 3600_000;
-  if (range === "1y") return 365 * 24 * 3600_000;
-  return null;
-}
-
 function rangeCutoffMs(range: PaperTimeRange, sessionStartedAt: number | null): number | null {
   const delta = rangeDeltaMs(range);
   if (delta != null) return Date.now() - delta;
   if (range === "session") return sessionStartedAt;
   return null;
-}
-
-function domainForRange(
-  range: PaperTimeRange,
-  sessionStartedAt: number | null,
-  series: PaperSample[],
-): { start: number; end: number } {
-  const end = Date.now();
-  const delta = rangeDeltaMs(range);
-  if (delta != null) return { start: end - delta, end };
-  if (range === "session") {
-    const start = sessionStartedAt ?? series[0]?.t ?? end - 3600_000;
-    return { start: Math.min(start, end - 60_000), end };
-  }
-  if (series.length) {
-    return { start: Math.min(series[0].t, end - 60_000), end };
-  }
-  return { start: end - 3600_000, end };
 }
 
 function formatAxisTime(t: number, spanMs: number): string {
@@ -201,22 +180,6 @@ function niceMoneyTicks(min: number, max: number, count = 4): number[] {
   return ticks.length ? ticks : [min, max];
 }
 
-/** Straight polylines only — cubic beziers scribbled on dense samples. */
-function linePath(points: Array<{ x: number; y: number }>): string {
-  if (!points.length) return "";
-  return points
-    .map((p, i) => `${i === 0 ? "M" : "L"}${p.x.toFixed(1)},${p.y.toFixed(1)}`)
-    .join(" ");
-}
-
-function areaPath(points: Array<{ x: number; y: number }>, baselineY: number): string {
-  if (!points.length) return "";
-  const line = linePath(points);
-  const first = points[0];
-  const last = points[points.length - 1];
-  return `${line} L${last.x.toFixed(1)},${baselineY.toFixed(1)} L${first.x.toFixed(1)},${baselineY.toFixed(1)} Z`;
-}
-
 function nearestIndex(series: PaperSample[], t: number): number {
   if (!series.length) return -1;
   let best = 0;
@@ -231,11 +194,58 @@ function nearestIndex(series: PaperSample[], t: number): number {
   return best;
 }
 
+/** Split polyline by signed scalar series (gain ≥ 0 / loss < 0), inserting baseline crosses. */
+function strokeBySign(
+  points: XY[],
+  values: number[],
+  zeroY: number,
+): { positive: XY[][]; negative: XY[][] } {
+  const positive: XY[][] = [];
+  const negative: XY[][] = [];
+  if (points.length < 2 || points.length !== values.length) {
+    return { positive, negative };
+  }
+  let current: XY[] = [points[0]];
+  let sign = Math.sign(values[0]) || 1;
+  const flush = () => {
+    if (current.length >= 2) {
+      if (sign >= 0) positive.push(current);
+      else negative.push(current);
+    }
+    current = [];
+  };
+  for (let i = 1; i < points.length; i += 1) {
+    const prevV = values[i - 1];
+    const nextV = values[i];
+    let nextSign = Math.sign(nextV);
+    if (nextSign === 0) nextSign = sign;
+    if (sign !== nextSign) {
+      let crossX: number;
+      if (prevV === 0) crossX = points[i - 1].x;
+      else if (nextV === 0) crossX = points[i].x;
+      else {
+        const t = prevV / (prevV - nextV);
+        crossX = points[i - 1].x + (points[i].x - points[i - 1].x) * t;
+      }
+      current.push({ x: crossX, y: zeroY });
+      flush();
+      current = [{ x: crossX, y: zeroY }];
+      if (nextV !== 0) current.push(points[i]);
+      sign = nextSign;
+    } else {
+      current.push(points[i]);
+    }
+  }
+  flush();
+  return { positive, negative };
+}
+
 export function PaperSessionChart({
   equity,
   cash,
   positions,
   pnl,
+  initialBalance,
   live,
   maxPoints = 480,
 }: PaperSessionChartProps) {
@@ -254,6 +264,12 @@ export function PaperSessionChart({
   const svgRef = useRef<SVGSVGElement | null>(null);
   rangeRef.current = range;
   liveRef.current = { equity, cash, positions, pnl };
+
+  const breakEven =
+    Number.isFinite(initialBalance) && (initialBalance ?? 0) > 0
+      ? Number(initialBalance)
+      : null;
+  const clipId = useId().replace(/:/g, "");
 
   useEffect(() => {
     setRange(loadRange());
@@ -433,12 +449,14 @@ export function PaperSessionChart({
     if (plotSeries.length) {
       for (const s of plotSeries) {
         moneyVals.push(s.equity);
-        if (layers.cash && s.cash > 0) moneyVals.push(s.cash);
+        // Only scale against plausible cash — zeros collapse the axis / shoot lines off-chart.
+        if (layers.cash && s.cash > 0 && s.cash <= s.equity * 1.05) moneyVals.push(s.cash);
       }
     } else {
       moneyVals.push(equity);
       if (cash > 0) moneyVals.push(cash);
     }
+    if (breakEven != null && breakEven > 0) moneyVals.push(breakEven);
 
     let minM = Math.min(...moneyVals);
     let maxM = Math.max(...moneyVals);
@@ -474,10 +492,41 @@ export function PaperSessionChart({
     const yPnl = (v: number) => PAD.top + ((maxPnl - v) / (maxPnl - minPnl)) * innerH;
 
     const equityPts = plotSeries.map((s) => ({ x: xAtTime(s.t), y: yMoney(s.equity) }));
+    const equityVals = plotSeries.map((s) => s.equity);
     const cashPts = plotSeries.map((s) => ({ x: xAtTime(s.t), y: yMoney(s.cash) }));
+    const cashValid = plotSeries.map(
+      (s) => Number.isFinite(s.cash) && s.cash > 0 && s.cash <= Math.max(s.equity, 1) * 1.05,
+    );
     const pnlPts = plotSeries.map((s) => ({ x: xAtTime(s.t), y: yPnl(s.pnl) }));
     const posPts = plotSeries.map((s) => ({ x: xAtTime(s.t), y: yPos(s.positions) }));
-    const ddPts = plotSeries.map((s) => ({ x: xAtTime(s.t), y: yDd(s.drawdownPct) }));
+    const ddPts = plotSeries.map((s) => ({
+      x: xAtTime(s.t),
+      y: yDd(Math.min(s.drawdownPct, maxDd)),
+    }));
+
+    const breakEvenY = breakEven != null ? yMoney(breakEven) : null;
+    const signedFill =
+      breakEven != null && breakEvenY != null && equityPts.length > 1
+        ? signedAreaPaths(equityPts, equityVals, breakEvenY, breakEven)
+        : { gain: "", loss: "" };
+
+    const equityStroke =
+      breakEven != null && breakEvenY != null && equityPts.length > 1
+        ? strokeBySign(
+            equityPts,
+            equityVals.map((v) => v - breakEven),
+            breakEvenY,
+          )
+        : { positive: equityPts.length ? [equityPts] : [], negative: [] as XY[][] };
+
+    const pnlStroke =
+      pnlPts.length > 1
+        ? strokeBySign(
+            pnlPts,
+            plotSeries.map((s) => s.pnl),
+            yPnl(0),
+          )
+        : { positive: [] as XY[][], negative: [] as XY[][] };
 
     const moneyTicks = niceMoneyTicks(minM, maxM, 4).map((v) => ({
       y: yMoney(v),
@@ -490,15 +539,26 @@ export function PaperSessionChart({
       return { x: PAD.left + innerW * f, label: formatAxisTime(t, span) };
     });
 
+    const dataSpan =
+      plotRaw.length >= 2 ? plotRaw[plotRaw.length - 1].t - plotRaw[0].t : 0;
+    const fitted =
+      plotRaw.length >= 2 && dataSpan < span * 0.45;
+
     return {
       equityPts,
       cashPts,
+      cashPath: pathSkippingInvalid(cashPts, cashValid),
       pnlPts,
       posPts,
       ddPts,
       moneyTicks,
       timeTicks,
       baselineY: PAD.top + innerH,
+      breakEvenY,
+      signedFill,
+      equityStroke,
+      pnlStroke,
+      pnlZeroY: yPnl(0),
       innerW,
       innerH,
       xAtTime,
@@ -506,12 +566,13 @@ export function PaperSessionChart({
       pointCount: plotSeries.length,
       rawCount: plotRaw.length,
       hasSeries: plotSeries.length >= 1,
-      sparse: plotRaw.length < 3 || (plotRaw.length >= 2 && plotRaw[plotRaw.length - 1].t - plotRaw[0].t < span * 0.2),
+      sparse: plotRaw.length < 3 || dataSpan < span * 0.2,
+      fitted,
       pnlPositive: chartPnl >= 0,
     };
   }, [
     plotSeries,
-    plotRaw.length,
+    plotRaw,
     chartPnl,
     drawdownPct,
     domain,
@@ -521,6 +582,7 @@ export function PaperSessionChart({
     pnl,
     positions,
     layers.cash,
+    breakEven,
   ]);
 
   function onPointerMove(e: ReactPointerEvent<SVGSVGElement>) {
@@ -534,6 +596,8 @@ export function PaperSessionChart({
 
   const hoverSample = hoverIdx != null ? plotSeries[hoverIdx] : null;
   const hoverX = hoverSample != null ? geometry.xAtTime(hoverSample.t) : null;
+  const activePnl = active?.pnl ?? pnl;
+  const inGain = breakEven != null ? (active?.equity ?? equity) >= breakEven : activePnl >= 0;
 
   return (
     <section className="card overflow-hidden">
@@ -551,12 +615,23 @@ export function PaperSessionChart({
                 Connexion…
               </span>
             )}
+            {geometry.hasSeries ? (
+              <span
+                className={`rounded-full px-2.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide ${
+                  inGain ? "bg-gain/15 text-gain" : "bg-loss/15 text-loss"
+                }`}
+              >
+                {inGain ? "En gain" : "En perte"}
+              </span>
+            ) : null}
           </div>
           <p className="mt-0.5 text-xs text-muted">
             Fenêtre <span className="text-slate-300">{windowLabel(range, span)}</span>
+            {geometry.fitted ? " · zoom auto sur l’historique dispo" : ""}
             {" · "}
             equity {layers.cash ? "+ cash" : ""}
-            {geometry.sparse ? " · données encore courtes sur cette échelle" : ""}
+            {breakEven != null ? ` · seuil ${money(breakEven)} $` : ""}
+            {geometry.sparse && !geometry.fitted ? " · données encore courtes sur cette échelle" : ""}
           </p>
         </div>
         <div
@@ -678,8 +753,16 @@ export function PaperSessionChart({
             onPointerLeave={() => setHoverIdx(null)}
           >
             <defs>
-              <linearGradient id="eqFill" x1="0" y1="0" x2="0" y2="1">
-                <stop offset="0%" stopColor={COLORS.equity} stopOpacity="0.28" />
+              <clipPath id={`paper-plot-clip-${clipId}`}>
+                <rect
+                  x={PAD.left}
+                  y={PAD.top}
+                  width={geometry.innerW}
+                  height={geometry.innerH}
+                />
+              </clipPath>
+              <linearGradient id={`eqFill-${clipId}`} x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stopColor={COLORS.equity} stopOpacity="0.18" />
                 <stop offset="100%" stopColor={COLORS.equity} stopOpacity="0.02" />
               </linearGradient>
             </defs>
@@ -707,72 +790,160 @@ export function PaperSessionChart({
               </g>
             ))}
 
-            {layers.positions && geometry.pointCount > 1 ? (
-              <path
-                d={linePath(geometry.posPts)}
-                fill="none"
-                stroke={COLORS.positions}
-                strokeWidth={1.25}
-                strokeDasharray="4 3"
-                opacity={0.65}
-              />
-            ) : null}
-
-            {layers.drawdown && geometry.pointCount > 1 ? (
-              <path
-                d={linePath(geometry.ddPts)}
-                fill="none"
-                stroke={COLORS.drawdown}
-                strokeWidth={1.25}
-                strokeDasharray="5 3"
-                opacity={0.75}
-              />
-            ) : null}
-
-            {layers.pnl && geometry.pointCount > 1 ? (
-              <path
-                d={linePath(geometry.pnlPts)}
-                fill="none"
-                stroke={geometry.pnlPositive ? COLORS.pnl : COLORS.pnlNeg}
-                strokeWidth={1.5}
-                opacity={0.85}
-              />
-            ) : null}
-
-            {layers.cash && geometry.pointCount > 0 ? (
-              <path
-                d={linePath(geometry.cashPts)}
-                fill="none"
-                stroke={COLORS.cash}
-                strokeWidth={1.75}
-                strokeLinejoin="round"
-                strokeLinecap="round"
-              />
-            ) : null}
-
-            {geometry.pointCount > 0 ? (
-              <>
-                {geometry.pointCount > 1 ? (
-                  <path d={areaPath(geometry.equityPts, geometry.baselineY)} fill="url(#eqFill)" />
-                ) : null}
+            <g clipPath={`url(#paper-plot-clip-${clipId})`}>
+              {layers.positions && geometry.pointCount > 1 ? (
                 <path
-                  d={linePath(geometry.equityPts)}
+                  d={linePath(geometry.posPts)}
                   fill="none"
-                  stroke={COLORS.equity}
-                  strokeWidth={2.4}
+                  stroke={COLORS.positions}
+                  strokeWidth={1.25}
+                  strokeDasharray="4 3"
+                  opacity={0.65}
+                />
+              ) : null}
+
+              {layers.drawdown && geometry.pointCount > 1 ? (
+                <path
+                  d={linePath(geometry.ddPts)}
+                  fill="none"
+                  stroke={COLORS.drawdown}
+                  strokeWidth={1.25}
+                  strokeDasharray="5 3"
+                  opacity={0.75}
+                />
+              ) : null}
+
+              {layers.pnl && geometry.pointCount > 1 ? (
+                <>
+                  <line
+                    x1={PAD.left}
+                    x2={W - PAD.right}
+                    y1={geometry.pnlZeroY}
+                    y2={geometry.pnlZeroY}
+                    stroke={COLORS.breakEven}
+                    strokeWidth={1}
+                    strokeDasharray="3 3"
+                    opacity={0.7}
+                  />
+                  {geometry.pnlStroke.positive.map((seg, i) => (
+                    <path
+                      key={`pnl-pos-${i}`}
+                      d={linePath(seg)}
+                      fill="none"
+                      stroke={COLORS.pnl}
+                      strokeWidth={1.6}
+                      opacity={0.9}
+                    />
+                  ))}
+                  {geometry.pnlStroke.negative.map((seg, i) => (
+                    <path
+                      key={`pnl-neg-${i}`}
+                      d={linePath(seg)}
+                      fill="none"
+                      stroke={COLORS.pnlNeg}
+                      strokeWidth={1.6}
+                      opacity={0.9}
+                    />
+                  ))}
+                </>
+              ) : null}
+
+              {layers.cash && geometry.pointCount > 0 && geometry.cashPath ? (
+                <path
+                  d={geometry.cashPath}
+                  fill="none"
+                  stroke={COLORS.cash}
+                  strokeWidth={1.75}
                   strokeLinejoin="round"
                   strokeLinecap="round"
                 />
-                <circle
-                  cx={geometry.equityPts[geometry.equityPts.length - 1].x}
-                  cy={geometry.equityPts[geometry.equityPts.length - 1].y}
-                  r={4}
-                  fill={COLORS.equity}
-                  stroke={COLORS.panel}
-                  strokeWidth={2}
-                />
-              </>
-            ) : null}
+              ) : null}
+
+              {geometry.pointCount > 0 ? (
+                <>
+                  {geometry.pointCount > 1 && breakEven != null && geometry.signedFill.gain ? (
+                    <path d={geometry.signedFill.gain} fill={COLORS.gainFill} />
+                  ) : null}
+                  {geometry.pointCount > 1 && breakEven != null && geometry.signedFill.loss ? (
+                    <path d={geometry.signedFill.loss} fill={COLORS.lossFill} />
+                  ) : null}
+                  {geometry.pointCount > 1 && breakEven == null ? (
+                    <path
+                      d={areaPath(geometry.equityPts, geometry.baselineY)}
+                      fill={`url(#eqFill-${clipId})`}
+                    />
+                  ) : null}
+
+                  {breakEven != null && geometry.breakEvenY != null ? (
+                    <>
+                      <line
+                        x1={PAD.left}
+                        x2={W - PAD.right}
+                        y1={geometry.breakEvenY}
+                        y2={geometry.breakEvenY}
+                        stroke={COLORS.breakEven}
+                        strokeWidth={1.25}
+                        strokeDasharray="5 4"
+                      />
+                      <text
+                        x={W - PAD.right - 4}
+                        y={geometry.breakEvenY - 4}
+                        textAnchor="end"
+                        fill="#94a3b8"
+                        fontSize={9}
+                        fontFamily="ui-monospace, SFMono-Regular, Menlo, monospace"
+                      >
+                        seuil
+                      </text>
+                    </>
+                  ) : null}
+
+                  {breakEven != null ? (
+                    <>
+                      {geometry.equityStroke.positive.map((seg, i) => (
+                        <path
+                          key={`eq-pos-${i}`}
+                          d={linePath(seg)}
+                          fill="none"
+                          stroke={COLORS.pnl}
+                          strokeWidth={2.4}
+                          strokeLinejoin="round"
+                          strokeLinecap="round"
+                        />
+                      ))}
+                      {geometry.equityStroke.negative.map((seg, i) => (
+                        <path
+                          key={`eq-neg-${i}`}
+                          d={linePath(seg)}
+                          fill="none"
+                          stroke={COLORS.pnlNeg}
+                          strokeWidth={2.4}
+                          strokeLinejoin="round"
+                          strokeLinecap="round"
+                        />
+                      ))}
+                    </>
+                  ) : (
+                    <path
+                      d={linePath(geometry.equityPts)}
+                      fill="none"
+                      stroke={COLORS.equity}
+                      strokeWidth={2.4}
+                      strokeLinejoin="round"
+                      strokeLinecap="round"
+                    />
+                  )}
+                  <circle
+                    cx={geometry.equityPts[geometry.equityPts.length - 1].x}
+                    cy={geometry.equityPts[geometry.equityPts.length - 1].y}
+                    r={4}
+                    fill={inGain ? COLORS.pnl : COLORS.pnlNeg}
+                    stroke={COLORS.panel}
+                    strokeWidth={2}
+                  />
+                </>
+              ) : null}
+            </g>
 
             {hoverX != null && hoverSample ? (
               <g pointerEvents="none">
@@ -788,7 +959,11 @@ export function PaperSessionChart({
                   cx={hoverX}
                   cy={geometry.yMoney(hoverSample.equity)}
                   r={4.5}
-                  fill={COLORS.equity}
+                  fill={
+                    breakEven != null && hoverSample.equity < breakEven
+                      ? COLORS.pnlNeg
+                      : COLORS.pnl
+                  }
                   stroke="#fff"
                   strokeWidth={1.5}
                 />
