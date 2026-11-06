@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
@@ -27,7 +28,7 @@ from app.risk import (
     risk_position_spend,
     sell_is_net_positive,
 )
-from app.signals.flags import SignalFeatureFlags
+from app.signals.flags import SignalFeatureFlags, env_flag_overrides
 from app.signals.gates import evaluate_entry_gates
 from app.signals.kelly import evaluate_kelly
 from app.signals.oos import evaluate_oos
@@ -219,11 +220,20 @@ class TradingRuntime:
         self.store.save_params(self.params, self.alerts.params)
         self._db_ok = True
 
+    def _apply_env_signal_flags(self, params: BotParams) -> BotParams:
+        """Overlay Coolify SIGNAL_* / WEB_PUSH_ENABLED when explicitly set."""
+        overrides = env_flag_overrides(os.getenv)
+        if not overrides:
+            return params
+        data = params.model_dump()
+        data.update(overrides)
+        return BotParams(**data)
+
     def _reload_params_only(self) -> None:
         if self.store is None:
             return
         params, alerts = self.store.load_params()
-        self.params = params
+        self.params = self._apply_env_signal_flags(params)
         self.alerts.params = alerts
         self._db_ok = True
 
