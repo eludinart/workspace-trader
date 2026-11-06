@@ -1,14 +1,14 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { money } from "@/lib/engine";
-import { actionLabel } from "@/lib/signal-fr";
+import { TradeFillRow } from "@/components/TradeFillRow";
+import type { AnnotatedTrade } from "@/lib/trade-display";
 
 type LiveOrdersProps = {
-  trades: Array<Record<string, unknown>>;
+  trades: AnnotatedTrade[];
 };
 
-/** Newest paper fills with flash on arrival (type, token, price, qty, time). */
+/** Newest paper fills with flash on arrival (P&L / investi annotés). */
 export function LiveOrders({ trades }: LiveOrdersProps) {
   const [flashId, setFlashId] = useState<string | null>(null);
   const seen = useRef<Set<string>>(new Set());
@@ -40,44 +40,16 @@ export function LiveOrders({ trades }: LiveOrdersProps) {
           Live
         </span>
       </div>
-      <p className="mb-2 text-xs text-muted">Achats / ventes simulés — pas ton compte Coinbase.</p>
+      <p className="mb-2 text-xs text-muted">
+        Achats = montant investi · ventes = P&L réalisé net (frais inclus, slip dans le fill).
+      </p>
       <ul className="max-h-64 space-y-1.5 overflow-auto text-sm">
         {trades.length === 0 ? (
           <li className="text-muted">Aucun fill pour l’instant…</li>
         ) : (
           trades.map((t) => {
             const id = String(t.id || "");
-            const side = String(t.side || "").toLowerCase();
-            const sym = String(t.symbol || "—");
-            const ts = t.ts ? new Date(String(t.ts)).toLocaleTimeString("fr-FR") : "—";
-            const hot = id === flashId;
-            return (
-              <li
-                key={id}
-                className={`rounded-md border px-2 py-1.5 transition-colors ${
-                  hot
-                    ? "border-riskBlue/70 bg-riskBlue/15"
-                    : "border-line/50 bg-ink/30"
-                }`}
-              >
-                <div className="flex flex-wrap items-center justify-between gap-1">
-                  <span
-                    className={`font-semibold ${
-                      side === "buy" ? "text-gain" : side === "sell" ? "text-loss" : ""
-                    }`}
-                  >
-                    {actionLabel(side)} {sym.replace(/-USD$/i, "")}
-                  </span>
-                  <span className="text-[10px] text-muted">{ts}</span>
-                </div>
-                <div className="mt-0.5 flex justify-between text-xs text-slate-300">
-                  <span>
-                    qté {Number(t.qty).toFixed(5)} @ {money(Number(t.price))}
-                  </span>
-                  <span className="text-muted">{String(t.note || "paper")}</span>
-                </div>
-              </li>
-            );
+            return <TradeFillRow key={id} trade={t} hot={id === flashId} dense />;
           })
         )}
       </ul>

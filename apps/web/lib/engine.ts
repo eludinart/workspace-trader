@@ -23,6 +23,8 @@ export type Account = {
   realized_pnl: number;
   unrealized_pnl: number;
   total_pnl: number;
+  exposure_quote?: number;
+  marks_as_of?: string;
   positions: Array<{
     symbol: string;
     qty: number;
@@ -30,6 +32,8 @@ export type Account = {
     mark_price: number;
     market_value: number;
     unrealized_pnl: number;
+    cost_basis?: number;
+    mark_ts?: string;
     gross_pnl?: number;
     net_pnl?: number;
     net_pnl_pct?: number;
@@ -38,6 +42,9 @@ export type Account = {
   }>;
   fee_bps?: number;
   slippage_bps?: number;
+  latency_ms?: number;
+  order_impact_enabled?: boolean;
+  signal_flags?: Record<string, boolean>;
   symbol: string;
   symbols?: string[];
   active_symbol?: string;

@@ -7,6 +7,10 @@ import { ActivityFeed } from "@/components/ActivityFeed";
 import { AppNav, type AppPage } from "@/components/AppNav";
 import { LiveEquity } from "@/components/LiveEquity";
 import { LiveOrders } from "@/components/LiveOrders";
+import { MobileAccountStrip } from "@/components/MobileAccountStrip";
+import { TradeFillRow } from "@/components/TradeFillRow";
+import { WebPushOptIn } from "@/components/WebPushOptIn";
+import type { AnnotatedTrade } from "@/lib/trade-display";
 import { NewsPanel } from "@/components/NewsPanel";
 import { PaperSessionChart } from "@/components/PaperSessionChart";
 import { PositionsPanel } from "@/components/PositionsPanel";
@@ -836,6 +840,7 @@ export function Dashboard() {
             Biais {newsBrief?.overall_score != null ? newsBrief.overall_score.toFixed(2) : "—"}
           </span>
         </div>
+        <MobileAccountStrip account={account} />
         <div className="col-span-2">
           <PaperSessionChart
             equity={account?.equity ?? 0}
@@ -1239,23 +1244,18 @@ export function Dashboard() {
 
       {page === "orders" ? (
         <div className="mt-2 grid gap-4 md:grid-cols-2">
-          <LiveOrders trades={trades} />
+          <LiveOrders trades={trades as AnnotatedTrade[]} />
           <section className="card">
             <h2 className="mb-2 text-lg font-medium">Historique paper</h2>
+            <p className="mb-2 text-xs text-muted">
+              Vente = P&L net quote · achat = investi · gris si données incomplètes (pas de P&L inventé).
+            </p>
             <ul className="max-h-[28rem] space-y-2 overflow-auto text-sm">
               {trades.length === 0 ? (
                 <li className="text-muted">Aucun fill</li>
               ) : (
                 trades.map((t) => (
-                  <li key={String(t.id)} className="flex justify-between border-b border-line/50 pb-1">
-                    <span>
-                      {actionLabel(String(t.side))} {String(t.symbol || "")} · {Number(t.qty).toFixed(5)}
-                    </span>
-                    <span className="text-muted">
-                      {money(Number(t.price))} ·{" "}
-                      {t.ts ? new Date(String(t.ts)).toLocaleString("fr-FR") : ""}
-                    </span>
-                  </li>
+                  <TradeFillRow key={String(t.id)} trade={t as AnnotatedTrade} />
                 ))
               )}
             </ul>
@@ -1394,11 +1394,19 @@ export function Dashboard() {
           </form>
         </section>
 
-        <section className="card md:col-span-6">
+        <section className="card md:col-span-6 space-y-4">
+          <div>
+            <h2 className="mb-3 text-lg font-medium">Alertes Web Push (recommandé)</h2>
+            <WebPushOptIn />
+          </div>
+          <div>
           <h2 className="mb-3 text-lg font-medium">Alertes Telegram</h2>
+          <p className="mb-2 text-xs text-muted">
+            Conservé pour compatibilité — ne pas activer (préférence Eric : Web Push uniquement).
+          </p>
           <form className="grid grid-cols-2 gap-3" onSubmit={(e) => void saveAlerts(e)}>
             <label className="col-span-2 flex items-center gap-2 text-sm">
-              <input type="checkbox" name="telegram_enabled" defaultChecked={Boolean(alerts.telegram_enabled)} /> Activer Telegram
+              <input type="checkbox" name="telegram_enabled" defaultChecked={false} disabled /> Activer Telegram (désactivé)
             </label>
             <Field name="telegram_chat_id" label="ID du chat" defaultValue={String(alerts.telegram_chat_id || "")} />
             <Field name="telegram_bot_token" label="Jeton du bot" defaultValue={String(alerts.telegram_bot_token || "")} />
@@ -1409,6 +1417,7 @@ export function Dashboard() {
             <label className="col-span-2 flex items-center gap-2 text-sm"><input type="checkbox" name="alert_on_strong_signal" defaultChecked={alerts.alert_on_strong_signal !== false} /> Sur signal fort</label>
             <button className="btn-primary col-span-2" disabled={busy} type="submit">Enregistrer alertes</button>
           </form>
+          </div>
         </section>
 
         <section className="card md:col-span-5">
