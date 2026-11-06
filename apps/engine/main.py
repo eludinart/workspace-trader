@@ -317,6 +317,10 @@ def system_status() -> dict[str, Any]:
 @app.get("/fidelity")
 def get_fidelity() -> dict[str, Any]:
     """Execution-twin fidelity + go-live gate (shadow only — never places real orders)."""
+    try:
+        runtime.hydrate()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("fidelity hydrate: %s", exc)
     return runtime.fidelity_report()
 
 

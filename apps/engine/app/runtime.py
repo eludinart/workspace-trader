@@ -743,7 +743,42 @@ class TradingRuntime:
             )
         )
 
+    def _seed_fidelity_from_trades(self) -> None:
+        """API process has no live twin samples — rebuild from persisted fills.
+
+        Counts trades whose fee rate matches the current taker tier (skips legacy
+        10 bps paper fills) so /fidelity works across the trader/API split.
+        """
+        if self.fidelity.samples:
+            return
+        taker = float(getattr(self.params, "taker_fee_bps", self.params.fee_bps))
+        for t in self.wallet.trades:
+            notional = float(t.qty) * float(t.price)
+            if notional <= 0:
+                continue
+            fee_bps_obs = float(t.fee) / notional * 10_000.0
+            # Twin wallet fees ≈ taker; legacy paper was ~10 bps.
+            if taker >= 40 and abs(fee_bps_obs - taker) > 25:
+                continue
+            if t.decision_price is None and t.slip_bps is None:
+                continue
+            self.fidelity.record(
+                FillSample(
+                    ts=t.ts if isinstance(t.ts, datetime) else datetime.now(timezone.utc),
+                    symbol=str(t.symbol),
+                    side=str(t.side),
+                    source="coinbase_l2",
+                    slip_bps=float(t.slip_bps or 0),
+                    impact_bps=float(t.impact_bps or 0),
+                    filled_notional=notional,
+                    unfilled_notional=0.0,
+                    rejected=False,
+                    fee_bps=fee_bps_obs,
+                )
+            )
+
     def fidelity_report(self) -> dict[str, Any]:
+        self._seed_fidelity_from_trades()
         return self.fidelity.report(
             twin_enabled=bool(getattr(self.params, "execution_twin_enabled", True)),
             fee_tier=str(getattr(self.params, "fee_tier", "us_intro")),
