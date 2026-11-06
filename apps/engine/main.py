@@ -186,7 +186,12 @@ class ParamsUpdate(BaseModel):
     candle_granularity_sec: int | None = None
     candle_lookback: int | None = None
     auto_trade: bool | None = None
+    execution_twin_enabled: bool | None = None
+    fee_tier: str | None = None
+    maker_fee_bps: float | None = None
+    taker_fee_bps: float | None = None
     fee_bps: float | None = None
+    twin_min_fill_notional: float | None = Field(default=None, ge=1.0)
     slippage_bps: float | None = None
     latency_ms: int | None = Field(default=None, ge=0, le=5000)
     latency_wall_clock: bool | None = None
@@ -309,6 +314,12 @@ def system_status() -> dict[str, Any]:
     return runtime.system_status()
 
 
+@app.get("/fidelity")
+def get_fidelity() -> dict[str, Any]:
+    """Execution-twin fidelity + go-live gate (shadow only — never places real orders)."""
+    return runtime.fidelity_report()
+
+
 @app.get("/")
 def root() -> dict[str, str]:
     return {"message": "workspace-trader engine", "mode": "paper", "docs": "/docs"}
@@ -421,6 +432,14 @@ def get_signal_stubs(symbol: str | None = None) -> dict[str, Any]:
             "enabled": bool(getattr(runtime.params, "order_book_depth_enabled", False)),
             "levels": int(getattr(runtime.params, "order_book_depth_levels", 5) or 5),
             "label": "simulated_book:hypothesis",
+        },
+        "execution_twin": {
+            "enabled": bool(getattr(runtime.params, "execution_twin_enabled", True)),
+            "fee_tier": str(getattr(runtime.params, "fee_tier", "us_intro")),
+            "taker_fee_bps": float(getattr(runtime.params, "taker_fee_bps", 90)),
+            "maker_fee_bps": float(getattr(runtime.params, "maker_fee_bps", 50)),
+            "source": "coinbase_l2",
+            "fidelity": runtime.fidelity_report(),
         },
     }
 

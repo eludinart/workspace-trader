@@ -22,7 +22,7 @@ Architecture inspirée de frameworks modulaires type Hummingbot (connectors / st
 
 ## Fonctionnalités
 
-- Wallet paper : cash, positions, PnL, **frais** + **slippage** (+ latence simulée, impact optionnel off)
+- Wallet paper : cash, positions, PnL — **jumeau d’exécution L2** (carnet Coinbase réel + frais taker tier, défaut US 90 bps) ; legacy slip si `execution_twin_enabled=false`
 - Historic paper : P&L réalisé net par vente / montant investi à l’achat (pas de P&L inventé sur données incomplètes)
 - Données **Coinbase** (API publique, lecture seule)
 - Stratégie **XGBoost v1** (RSI, MACD, volumes, …) + score de confiance
@@ -81,6 +81,7 @@ npm run dev
 | GET | `/journal` | Journal de décision |
 | GET | `/trades` | Fills annotés (P&L / investi) |
 | GET | `/signals/flags` `/signals/stubs` `/signals/oos` | Flags + stubs 14–21 + harness OOS |
+| GET | `/fidelity` | Gate jumeau L2 (go_live_ready, friction, fills) |
 | PUT | `/params` | Paramètres bot / modèle |
 | PUT | `/alerts/params` | Alertes |
 | POST | `/backtest` | Backtest `{symbol,start,end}` |

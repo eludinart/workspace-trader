@@ -12,7 +12,8 @@ from app.config import AlertParams, BotParams
 from app.events import EventBus
 from app.lease import read_lease
 from app.execution import OrderPlan, buy_spend, cooldown_active, plan_protective, plan_signal
-from app.fill_model import impact_bps_for_notional, quote_fill, walk_book_fill
+from app.fidelity import FillSample, FidelityTracker
+from app.fill_model import impact_bps_for_notional, quote_fill, walk_book_fill, walk_real_book
 from app.journal import DecisionJournal
 from app.market.coinbase import CoinbaseClient
 from app.narrative import decision_narrative, format_other_exits, thresholds_from_detail
@@ -79,6 +80,11 @@ def _plan_from_note(side: str, note: str) -> OrderPlan:
     return OrderPlan(side, fraction, reason, note)
 
 
+
+def _utc_now_safe() -> datetime:
+    return datetime.now(timezone.utc)
+
+
 class TradingRuntime:
     def __init__(self, store: Store | None = None, lease: LeaseManager | None = None) -> None:
         self.store = store
@@ -113,6 +119,8 @@ class TradingRuntime:
         self.active_symbol: str = self.params.symbol
         self.last_signal_symbol: str | None = None
         self.prices: dict[str, float] = {}
+        self.quotes: dict[str, dict[str, float]] = {}
+        self.fidelity = FidelityTracker()
         self._rr_index = 0
         self._price_rr = 0
         self._last_buy_at: dict[str, datetime] = {}
@@ -719,35 +727,119 @@ class TradingRuntime:
             web_push_enabled=bool(self.params.web_push_enabled),
         )
 
-    def _build_fill_quote(self, side: str, decision_price: float, *, notional: float) -> Any:
-        if self.params.latency_wall_clock and self.params.latency_ms > 0:
-            time.sleep(self.params.latency_ms / 1000.0)
+    def _record_fidelity(self, q: Any, *, symbol: str, side: str) -> None:
+        self.fidelity.record(
+            FillSample(
+                ts=getattr(q, "decision_ts", None) or datetime.now(timezone.utc),
+                symbol=symbol,
+                side=side,
+                source=str(getattr(q, "source", "legacy_slip") or "legacy_slip"),
+                slip_bps=float(getattr(q, "slip_bps", 0) or 0),
+                impact_bps=float(getattr(q, "impact_bps", 0) or 0),
+                filled_notional=float(getattr(q, "filled_notional", 0) or 0),
+                unfilled_notional=float(getattr(q, "unfilled_notional", 0) or 0),
+                rejected=bool(getattr(q, "rejected", False)),
+                fee_bps=float(self.params.fee_bps),
+            )
+        )
+
+    def fidelity_report(self) -> dict[str, Any]:
+        return self.fidelity.report(
+            twin_enabled=bool(getattr(self.params, "execution_twin_enabled", True)),
+            fee_tier=str(getattr(self.params, "fee_tier", "us_intro")),
+            taker_fee_bps=float(getattr(self.params, "taker_fee_bps", self.params.fee_bps)),
+        )
+
+    def _side_mark(self, symbol: str, side: str, fallback: float) -> float:
+        """Buy against ask, sell against bid when twin quotes exist."""
+        q = self.quotes.get(symbol) or {}
+        if side == "buy":
+            ask = float(q.get("ask") or 0)
+            if ask > 0:
+                return ask
+        else:
+            bid = float(q.get("bid") or 0)
+            if bid > 0:
+                return bid
+        px = float(self.prices.get(symbol) or 0)
+        return px if px > 0 else float(fallback)
+
+    def _build_fill_quote(
+        self,
+        side: str,
+        decision_price: float,
+        *,
+        notional: float,
+        symbol: str | None = None,
+    ) -> Any:
+        twin = bool(getattr(self.params, "execution_twin_enabled", True))
+        latency_ms = int(self.params.latency_ms)
+        # Twin: always sleep then re-fetch L2 so fill is not the stale decision mid.
+        if twin or (self.params.latency_wall_clock and latency_ms > 0):
+            if latency_ms > 0:
+                time.sleep(latency_ms / 1000.0)
+
+        if twin and symbol:
+            try:
+                book = self.market.get_order_book(symbol, level=2)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("order book %s: %s — falling back to legacy slip", symbol, exc)
+                book = None
+            if book is not None:
+                mid = float(book.get("mid") or decision_price or 0) or float(decision_price)
+                fetched = book.get("fetched_at")
+                age_ms = 0
+                if isinstance(fetched, str):
+                    try:
+                        ft = datetime.fromisoformat(fetched.replace("Z", "+00:00"))
+                        age_ms = max(0, int((_utc_now_safe() - ft).total_seconds() * 1000))
+                    except ValueError:
+                        age_ms = 0
+                q = walk_real_book(
+                    side,
+                    bids=book.get("bids") or [],
+                    asks=book.get("asks") or [],
+                    notional=float(notional),
+                    decision_price=mid,
+                    latency_ms=latency_ms,
+                    min_fill_notional=float(
+                        getattr(self.params, "twin_min_fill_notional", 15.0) or 15.0
+                    ),
+                    book_age_ms=age_ms,
+                )
+                self._record_fidelity(q, symbol=symbol, side=side)
+                return q
+
         if bool(getattr(self.params, "order_book_depth_enabled", False)):
-            return walk_book_fill(
+            q = walk_book_fill(
                 side,
                 decision_price,
                 notional,
-                latency_ms=int(self.params.latency_ms),
+                latency_ms=latency_ms,
                 depth_levels=int(getattr(self.params, "order_book_depth_levels", 5) or 5),
                 base_slip_bps=float(self.params.slippage_bps),
             )
-        fill_mid = decision_price
-        # After simulated latency, refresh mark when possible (adverse path).
-        # Caller may pass a symbol via prices; we keep mid unless wall-clock refreshed.
+            if symbol:
+                self._record_fidelity(q, symbol=symbol, side=side)
+            return q
+
         impact = impact_bps_for_notional(
             notional,
             enabled=bool(self.params.order_impact_enabled),
             equity=max(self._equity(), 1.0),
             max_impact_bps=float(self.params.impact_bps_max),
         )
-        return quote_fill(
+        q = quote_fill(
             side,
             decision_price,
             slip_bps=float(self.params.slippage_bps),
-            latency_ms=int(self.params.latency_ms),
+            latency_ms=latency_ms,
             impact_bps=impact,
-            fill_mid=fill_mid,
+            fill_mid=decision_price,
         )
+        if symbol:
+            self._record_fidelity(q, symbol=symbol, side=side)
+        return q
 
     def _closed_sell_pnls(self) -> list[float]:
         return [
@@ -864,10 +956,13 @@ class TradingRuntime:
         try:
             ticker = self.market.get_ticker(symbol)
             price = float(ticker["price"])
+            bid = float(ticker.get("bid") or price)
+            ask = float(ticker.get("ask") or price)
         except Exception as exc:  # noqa: BLE001
             logger.warning("ticker %s: %s", symbol, exc)
             return self.prices.get(symbol)
         self.prices[symbol] = price
+        self.quotes[symbol] = {"bid": bid, "ask": ask, "last": price}
         return price
 
     def _equity(self) -> float:
@@ -881,7 +976,14 @@ class TradingRuntime:
         qty = min(qty, pos.qty)
         if pos.qty - qty < 1e-8:
             qty = pos.qty
-        q = self._build_fill_quote("sell", price, notional=qty * price)
+        mark = self._side_mark(symbol, "sell", price)
+        q = self._build_fill_quote("sell", mark, notional=qty * mark, symbol=symbol)
+        if getattr(q, "rejected", False) or q.fill_price <= 0:
+            logger.info("sell rejected %s: %s", symbol, getattr(q, "reject_reason", "empty"))
+            return None
+        if getattr(q, "filled_notional", 0) and q.fill_price > 0:
+            filled_qty = float(q.filled_notional) / q.fill_price
+            qty = min(qty, filled_qty)
         try:
             trade = self.wallet.sell(
                 symbol,
@@ -1105,8 +1207,9 @@ class TradingRuntime:
                 floor_stop_pct=max(0.008, float(self.params.stop_loss_pct) * 0.5),
                 cap_stop_pct=0.04,
             )
-            # Slip-only provisional fill for sizing (no wall-clock sleep / impact).
-            fill = self._apply_slippage("buy", price)
+            # Provisional ask mark for sizing (no twin sleep yet).
+            ask_mark = self._side_mark(symbol, "buy", price)
+            fill = self._apply_slippage("buy", ask_mark)
             risk_frac = self._effective_risk_frac()
             assert risk_frac <= HARD_RISK_PER_TRADE_PCT + 1e-12
             risk_spend = risk_position_spend(
@@ -1131,9 +1234,15 @@ class TradingRuntime:
             fee_mult = 1.0 + self.params.fee_bps / 10_000.0
             if spend < 15 or fill <= 0:
                 return None, OrderPlan("hold", 0.0, "budget", "hold:budget")
-            q = self._build_fill_quote("buy", price, notional=spend)
+            q = self._build_fill_quote("buy", ask_mark, notional=spend, symbol=symbol)
+            if getattr(q, "rejected", False) or q.fill_price <= 0:
+                return None, OrderPlan(
+                    "hold", 0.0, "budget", "hold:insufficient_depth"
+                )
             fill = q.fill_price
-            qty = spend / (fill * fee_mult)
+            filled_spend = float(getattr(q, "filled_notional", 0) or spend)
+            filled_spend = min(filled_spend, spend)
+            qty = filled_spend / (fill * fee_mult)
             self._require_fill_authority()
             try:
                 trade = self.wallet.buy(
@@ -1775,6 +1884,25 @@ class TradingRuntime:
                 "Sauvegarde paper",
                 "warn",
                 "Pas encore de fichier d’état — sera créé au prochain tick",
+            )
+
+        twin_on = bool(getattr(self.params, "execution_twin_enabled", True))
+        fid = self.fidelity_report()
+        if twin_on:
+            gate = "ok" if fid.get("go_live_ready") else "warn"
+            add(
+                "execution_twin",
+                "Jumeau L2",
+                gate,
+                f"Twin Coinbase L2 · tier {fid.get('fee_tier')} · taker {fid.get('taker_fee_bps')} bps · "
+                f"fills {fid.get('twin_fill_count')} · {fid.get('message_fr')}",
+            )
+        else:
+            add(
+                "execution_twin",
+                "Jumeau L2",
+                "warn",
+                "OFF — fills legacy slip (paper trop rose vs live)",
             )
 
         if self.last_tick_at is None:

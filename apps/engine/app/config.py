@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
+from app.fees import FeeTier, normalize_fee_tier, resolve_fee_bps
 from app.trading_style import TradingStyle, normalize_style
 
 DEFAULT_SYMBOLS = ["BTC-USD", "ETH-USD", "SOL-USD"]
@@ -92,13 +93,19 @@ class BotParams(BaseModel):
     candle_granularity_sec: int = Field(default=3600, ge=60)
     candle_lookback: int = Field(default=300, ge=50, le=1000)
     auto_trade: bool = True
-    fee_bps: float = Field(default=10.0, ge=0)
-    slippage_bps: float = Field(default=5.0, ge=0)  # simulated adverse slippage
-    # Decision → fill latency (ms). Wall-clock sleep optional (off = record only).
+    # Execution twin (shadow): walk real Coinbase L2; fee_bps aliases taker.
+    execution_twin_enabled: bool = True
+    fee_tier: FeeTier = "us_intro"
+    maker_fee_bps: float = Field(default=50.0, ge=0)
+    taker_fee_bps: float = Field(default=90.0, ge=0)
+    fee_bps: float = Field(default=90.0, ge=0)  # wallet fee = taker when twin on
+    slippage_bps: float = Field(default=5.0, ge=0)  # legacy / fee_guard only when twin
+    # Decision → fill latency (ms). Twin always re-fetches book after this delay.
     latency_ms: int = Field(default=250, ge=0, le=5000)
-    latency_wall_clock: bool = False
+    latency_wall_clock: bool = True  # twin: sleep then re-quote L2
     order_impact_enabled: bool = False
     impact_bps_max: float = Field(default=5.0, ge=0, le=50)
+    twin_min_fill_notional: float = Field(default=15.0, ge=1.0)
     # Signal feature stubs — all false; see app.signals.flags
     confluence_enabled: bool = False
     mtf_enabled: bool = False
@@ -144,6 +151,11 @@ class BotParams(BaseModel):
     def _clean_style(cls, value: Any) -> str:
         return normalize_style(value)
 
+    @field_validator("fee_tier", mode="before")
+    @classmethod
+    def _clean_fee_tier(cls, value: Any) -> str:
+        return normalize_fee_tier(value)
+
     @field_validator("symbol")
     @classmethod
     def _clean_symbol(cls, value: str) -> str:
@@ -159,3 +171,16 @@ class BotParams(BaseModel):
     @classmethod
     def _clean_fractions(cls, value: Any) -> Any:
         return _as_fraction(value)
+
+    @model_validator(mode="after")
+    def _sync_fee_tier(self) -> BotParams:
+        """Presets overwrite maker/taker; fee_bps always tracks taker for wallet fills."""
+        maker, taker = resolve_fee_bps(
+            self.fee_tier,
+            maker_fee_bps=self.maker_fee_bps,
+            taker_fee_bps=self.taker_fee_bps,
+        )
+        self.maker_fee_bps = maker
+        self.taker_fee_bps = taker
+        self.fee_bps = taker
+        return self

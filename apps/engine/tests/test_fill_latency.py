@@ -51,5 +51,6 @@ def test_wallet_sell_pnl_does_not_reapply_slip():
 def test_bot_params_latency_defaults():
     p = BotParams()
     assert p.latency_ms == 250
-    assert p.latency_wall_clock is False
+    assert p.latency_wall_clock is True  # twin re-quotes after latency
     assert p.order_impact_enabled is False
+    assert p.execution_twin_enabled is True

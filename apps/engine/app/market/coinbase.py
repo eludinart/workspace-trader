@@ -35,6 +35,58 @@ class CoinbaseClient:
             "time": data.get("time"),
         }
 
+    def get_order_book(self, product_id: str, *, level: int = 2) -> dict[str, Any]:
+        """Public L2 snapshot. Level 2 = aggregated price→size map (not synthetic)."""
+        lvl = 2 if int(level) not in (1, 2, 3) else int(level)
+        fetched_at = datetime.now(timezone.utc)
+        resp = self._client.get(
+            f"/products/{product_id}/book",
+            params={"level": lvl},
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        bids_raw = data.get("bids") or []
+        asks_raw = data.get("asks") or []
+        bids: list[tuple[float, float]] = []
+        asks: list[tuple[float, float]] = []
+        for row in bids_raw:
+            if not isinstance(row, (list, tuple)) or len(row) < 2:
+                continue
+            price, size = float(row[0]), float(row[1])
+            if price > 0 and size > 0:
+                bids.append((price, size))
+        for row in asks_raw:
+            if not isinstance(row, (list, tuple)) or len(row) < 2:
+                continue
+            price, size = float(row[0]), float(row[1])
+            if price > 0 and size > 0:
+                asks.append((price, size))
+        # Best bid = highest; best ask = lowest.
+        bids.sort(key=lambda x: x[0], reverse=True)
+        asks.sort(key=lambda x: x[0])
+        best_bid = bids[0][0] if bids else None
+        best_ask = asks[0][0] if asks else None
+        mid = None
+        if best_bid is not None and best_ask is not None:
+            mid = (best_bid + best_ask) / 2.0
+        elif best_bid is not None:
+            mid = best_bid
+        elif best_ask is not None:
+            mid = best_ask
+        return {
+            "symbol": product_id,
+            "bids": bids,
+            "asks": asks,
+            "best_bid": best_bid,
+            "best_ask": best_ask,
+            "mid": mid,
+            "level": lvl,
+            "sequence": data.get("sequence"),
+            "auction_mode": data.get("auction_mode"),
+            "fetched_at": fetched_at.isoformat(),
+            "source": "coinbase_l2",
+        }
+
     def get_products(self) -> list[dict[str, Any]]:
         resp = self._client.get("/products")
         resp.raise_for_status()
