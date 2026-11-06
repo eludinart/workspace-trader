@@ -102,18 +102,22 @@ class Store:
 
                 cur.execute(
                     """
-                    SELECT symbol, qty, avg_entry, stop_pct, take_pct, exit_meta
+                    SELECT symbol, qty, avg_entry, stop_pct, take_pct, exit_meta, cost_basis
                     FROM positions ORDER BY symbol
                     """
                 )
                 runtime.wallet.positions.clear()
                 runtime._exit_levels.clear()
-                for symbol, qty, avg_entry, stop_pct, take_pct, exit_meta in cur.fetchall():
+                for symbol, qty, avg_entry, stop_pct, take_pct, exit_meta, cost_basis in cur.fetchall():
                     sym = str(symbol)
+                    avg = float(avg_entry)
+                    qty_f = float(qty)
+                    basis = float(cost_basis) if cost_basis is not None else avg * qty_f
                     runtime.wallet.positions[sym] = Position(
                         symbol=sym,
-                        qty=float(qty),
-                        avg_entry=float(avg_entry),
+                        qty=qty_f,
+                        avg_entry=avg,
+                        cost_basis=basis,
                     )
                     levels: dict[str, Any] = {}
                     if stop_pct is not None:
@@ -129,23 +133,61 @@ class Store:
 
                 cur.execute(
                     """
-                    SELECT id, symbol, side, qty, price, fee, ts, realized_pnl, note
+                    SELECT id, symbol, side, qty, price, fee, ts, realized_pnl, note,
+                           decision_ts, decision_price, latency_ms, slip_bps, impact_bps,
+                           invested_quote, avg_entry_ref, cost_basis_closed, reference_ts,
+                           meta_complete
                     FROM trades ORDER BY ts
                     """
                 )
                 runtime.wallet.trades.clear()
-                for tid, symbol, side, qty, price, fee, ts, realized_pnl, note in cur.fetchall():
+                for row in cur.fetchall():
+                    (
+                        tid,
+                        symbol,
+                        side,
+                        qty,
+                        price,
+                        fee,
+                        ts,
+                        realized_pnl,
+                        note,
+                        decision_ts,
+                        decision_price,
+                        latency_ms,
+                        slip_bps,
+                        impact_bps,
+                        invested_quote,
+                        avg_entry_ref,
+                        cost_basis_closed,
+                        reference_ts,
+                        meta_complete,
+                    ) = row
                     runtime.wallet.trades.append(
-                        Trade(
-                            id=str(tid),
-                            symbol=str(symbol),
-                            side=str(side),
-                            qty=float(qty),
-                            price=float(price),
-                            fee=float(fee),
-                            ts=ts if isinstance(ts, datetime) else _parse_ts(str(ts)),
-                            realized_pnl=float(realized_pnl),
-                            note=str(note or ""),
+                        Trade.from_dict(
+                            {
+                                "id": str(tid),
+                                "symbol": str(symbol),
+                                "side": str(side),
+                                "qty": float(qty),
+                                "price": float(price),
+                                "fee": float(fee),
+                                "ts": ts if isinstance(ts, datetime) else ts,
+                                "realized_pnl": float(realized_pnl),
+                                "note": str(note or ""),
+                                "decision_ts": decision_ts,
+                                "decision_price": decision_price,
+                                "latency_ms": latency_ms,
+                                "slip_bps": slip_bps,
+                                "impact_bps": impact_bps,
+                                "invested_quote": invested_quote,
+                                "avg_entry_ref": avg_entry_ref,
+                                "cost_basis_closed": cost_basis_closed,
+                                "reference_ts": reference_ts,
+                                "meta_complete": bool(meta_complete)
+                                if meta_complete is not None
+                                else False,
+                            }
                         )
                     )
 
@@ -501,8 +543,10 @@ class Store:
             exit_meta = _exit_meta_from_levels(levels)
             cur.execute(
                 """
-                INSERT INTO positions (symbol, qty, avg_entry, stop_pct, take_pct, exit_meta, updated_at)
-                VALUES (%s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+                INSERT INTO positions (
+                  symbol, qty, avg_entry, stop_pct, take_pct, exit_meta, cost_basis, updated_at
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
                 """,
                 (
                     sym,
@@ -511,6 +555,7 @@ class Store:
                     float(stop_pct) if stop_pct is not None else None,
                     float(take_pct) if take_pct is not None else None,
                     Json(exit_meta),
+                    float(pos.cost_basis),
                 ),
             )
 
@@ -519,8 +564,16 @@ class Store:
         for trade in runtime.wallet.trades:
             cur.execute(
                 """
-                INSERT INTO trades (id, symbol, side, qty, price, fee, ts, realized_pnl, note)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                INSERT INTO trades (
+                  id, symbol, side, qty, price, fee, ts, realized_pnl, note,
+                  decision_ts, decision_price, latency_ms, slip_bps, impact_bps,
+                  invested_quote, avg_entry_ref, cost_basis_closed, reference_ts, meta_complete
+                )
+                VALUES (
+                  %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                  %s, %s, %s, %s, %s,
+                  %s, %s, %s, %s, %s
+                )
                 """,
                 (
                     trade.id,
@@ -532,6 +585,16 @@ class Store:
                     trade.ts,
                     float(trade.realized_pnl),
                     trade.note,
+                    trade.decision_ts,
+                    trade.decision_price,
+                    trade.latency_ms,
+                    trade.slip_bps,
+                    trade.impact_bps,
+                    trade.invested_quote,
+                    trade.avg_entry_ref,
+                    trade.cost_basis_closed,
+                    trade.reference_ts,
+                    bool(trade.meta_complete),
                 ),
             )
 
@@ -629,12 +692,17 @@ class Store:
             qty = float(row.get("qty") or 0)
             if not sym or qty <= 0:
                 continue
+            avg_entry = float(row.get("avg_entry") or 0)
+            cost_basis = row.get("cost_basis")
+            basis = float(cost_basis) if cost_basis is not None else avg_entry * qty
             cur.execute(
                 """
-                INSERT INTO positions (symbol, qty, avg_entry, stop_pct, take_pct, exit_meta, updated_at)
-                VALUES (%s, %s, %s, NULL, NULL, %s, CURRENT_TIMESTAMP)
+                INSERT INTO positions (
+                  symbol, qty, avg_entry, stop_pct, take_pct, exit_meta, cost_basis, updated_at
+                )
+                VALUES (%s, %s, %s, NULL, NULL, %s, %s, CURRENT_TIMESTAMP)
                 """,
-                (sym, qty, float(row.get("avg_entry") or 0), Json({})),
+                (sym, qty, avg_entry, Json({}), basis),
             )
 
         cur.execute("DELETE FROM trades")
@@ -644,21 +712,40 @@ class Store:
             trade_id = str(row.get("id") or "")
             if not trade_id:
                 continue
+            trade = Trade.from_dict(row)
             cur.execute(
                 """
-                INSERT INTO trades (id, symbol, side, qty, price, fee, ts, realized_pnl, note)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                INSERT INTO trades (
+                  id, symbol, side, qty, price, fee, ts, realized_pnl, note,
+                  decision_ts, decision_price, latency_ms, slip_bps, impact_bps,
+                  invested_quote, avg_entry_ref, cost_basis_closed, reference_ts, meta_complete
+                )
+                VALUES (
+                  %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                  %s, %s, %s, %s, %s,
+                  %s, %s, %s, %s, %s
+                )
                 """,
                 (
                     trade_id,
-                    str(row.get("symbol") or ""),
-                    str(row.get("side") or "buy"),
-                    float(row.get("qty") or 0),
-                    float(row.get("price") or 0),
-                    float(row.get("fee") or 0),
-                    _parse_ts(str(row.get("ts")) if row.get("ts") else None),
-                    float(row.get("realized_pnl") or 0),
-                    str(row.get("note") or ""),
+                    trade.symbol,
+                    trade.side,
+                    float(trade.qty),
+                    float(trade.price),
+                    float(trade.fee),
+                    trade.ts,
+                    float(trade.realized_pnl),
+                    trade.note,
+                    trade.decision_ts,
+                    trade.decision_price,
+                    trade.latency_ms,
+                    trade.slip_bps,
+                    trade.impact_bps,
+                    trade.invested_quote,
+                    trade.avg_entry_ref,
+                    trade.cost_basis_closed,
+                    trade.reference_ts,
+                    bool(trade.meta_complete),
                 ),
             )
 

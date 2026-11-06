@@ -25,7 +25,15 @@ from app.lease import read_lease
 from app.migrate import run_migrations
 from app.news.models import NewsCategory
 from app.runtime import LeaseLost, TradingRuntime
+from app.signals.confluence import score_confluence
+from app.signals.kelly import evaluate_kelly
+from app.signals.mtf import evaluate_mtf_gate
+from app.signals.onchain import stub_onchain
+from app.signals.oos import evaluate_oos
+from app.signals.passive_wake import evaluate_passive_wake
+from app.signals.super_opp import detect_super_opportunity
 from app.store import Store
+from app.wallet import annotate_trade_for_display
 
 _LAST_BACKTEST_PATH = Path(__file__).resolve().parent / "data" / "last_backtest.json"
 _BACKTEST_SUMMARY_KEYS = (
@@ -177,6 +185,18 @@ class ParamsUpdate(BaseModel):
     auto_trade: bool | None = None
     fee_bps: float | None = None
     slippage_bps: float | None = None
+    latency_ms: int | None = Field(default=None, ge=0, le=5000)
+    latency_wall_clock: bool | None = None
+    order_impact_enabled: bool | None = None
+    impact_bps_max: float | None = Field(default=None, ge=0, le=50)
+    confluence_enabled: bool | None = None
+    mtf_enabled: bool | None = None
+    kelly_enabled: bool | None = None
+    onchain_enabled: bool | None = None
+    super_opp_enabled: bool | None = None
+    passive_wake_enabled: bool | None = None
+    post_trade_ai_enabled: bool | None = None
+    web_push_enabled: bool | None = None
     kill_switch_enabled: bool | None = None
     max_daily_loss_pct: float | None = None
     max_drawdown_pct: float | None = None
@@ -324,8 +344,61 @@ def close_position(body: ClosePositionBody) -> dict[str, Any]:
 
 @app.get("/trades")
 def get_trades(limit: int = 50) -> dict[str, Any]:
-    trades = [t.to_dict() for t in reversed(runtime.wallet.trades[-limit:])]
+    trades = [
+        annotate_trade_for_display(t) for t in reversed(runtime.wallet.trades[-limit:])
+    ]
     return {"trades": trades}
+
+
+@app.get("/signals/flags")
+def get_signal_flags() -> dict[str, Any]:
+    return {"flags": runtime.signal_flags().as_dict()}
+
+
+@app.get("/signals/oos")
+def get_oos_harness(min_holdout: int = 30) -> dict[str, Any]:
+    pnls = [
+        float(t.realized_pnl)
+        for t in runtime.wallet.trades
+        if t.side == "sell" and t.meta_complete
+    ]
+    report = evaluate_oos(pnls, min_holdout=min_holdout)
+    return report.to_dict()
+
+
+@app.get("/signals/stubs")
+def get_signal_stubs(symbol: str | None = None) -> dict[str, Any]:
+    """Read-only status of points 14–21 stubs (all gated by flags, off by default)."""
+    flags = runtime.signal_flags()
+    sym = (symbol or runtime.params.symbol or "BTC-USD").upper()
+    pnls = [float(t.realized_pnl) for t in runtime.wallet.trades if t.side == "sell"]
+    return {
+        "flags": flags.as_dict(),
+        "confluence": score_confluence({}, enabled=flags.confluence_enabled).to_dict(),
+        "mtf": evaluate_mtf_gate(
+            enabled=flags.mtf_enabled, intended_side="buy"
+        ).to_dict(),
+        "kelly": evaluate_kelly(pnls, enabled=flags.kelly_enabled).to_dict(),
+        "onchain": {
+            k: stub_onchain(k, sym, enabled=flags.onchain_enabled).to_dict()  # type: ignore[arg-type]
+            for k in ("whales", "funding", "liquidations")
+        },
+        "super_opp": detect_super_opportunity(
+            enabled=flags.super_opp_enabled,
+            risk_per_trade_pct=float(runtime.params.risk_per_trade_pct),
+        ).to_dict(),
+        "passive_wake": evaluate_passive_wake(
+            enabled=flags.passive_wake_enabled, move_pct=None
+        ).to_dict(),
+        "post_trade_ai": {
+            "enabled": flags.post_trade_ai_enabled,
+            "note": "async journal-only; never mutates PnL/positions; off in backtest pretrade",
+        },
+        "web_push": {
+            "enabled": flags.web_push_enabled,
+            "note": "VAPID via env only; no Telegram; HTTPS domain required",
+        },
+    }
 
 
 @app.get("/pnl")

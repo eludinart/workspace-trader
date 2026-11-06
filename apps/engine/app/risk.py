@@ -119,11 +119,14 @@ def net_pnl_if_closed(
     *,
     fee_bps: float,
     slippage_bps: float,
+    cost_basis: float | None = None,
 ) -> dict[str, float | bool]:
-    """Cash result of closing now: entry fee paid + exit fee + sell slippage.
+    """Cash result of closing now — same basis as ``PaperWallet.sell``.
 
-    Entry fill slippage is already inside ``avg_entry``. Entry fee was paid from
-    cash at buy time and is not in ``avg_entry``, so it must be subtracted here.
+    Entry fill slippage is already inside ``avg_entry``. Prefer open ``cost_basis``
+    (notionals + entry fees). Else reconstruct entry fee from ``fee_bps``.
+    Exit slippage is applied to mark for a hypothetical fill (not double-counted
+    against a fill that already embeds slip).
     """
     if avg_entry <= 0 or qty <= 0 or mark <= 0:
         return {
@@ -137,21 +140,25 @@ def net_pnl_if_closed(
     fee = max(0.0, float(fee_bps)) / 10_000.0
     slip = max(0.0, float(slippage_bps)) / 10_000.0
     entry_notional = avg_entry * qty
-    entry_fee = entry_notional * fee
-    cost_basis = entry_notional + entry_fee
+    if cost_basis is not None and float(cost_basis) > 0:
+        basis = float(cost_basis)
+        entry_fee = max(0.0, basis - entry_notional)
+    else:
+        entry_fee = entry_notional * fee
+        basis = entry_notional + entry_fee
     sell_fill = mark * (1.0 - slip)
     exit_notional = sell_fill * qty
     exit_fee = exit_notional * fee
     proceeds = exit_notional - exit_fee
     gross = (mark - avg_entry) * qty
-    net = proceeds - cost_basis
-    net_pct = (net / cost_basis) * 100.0 if cost_basis > 0 else 0.0
+    net = proceeds - basis
+    net_pct = (net / basis) * 100.0 if basis > 0 else 0.0
     return {
         "gross_pnl": float(gross),
         "net_pnl": float(net),
         "net_pnl_pct": float(net_pct),
         "fees_total": float(entry_fee + exit_fee),
-        "cost_basis": float(cost_basis),
+        "cost_basis": float(basis),
         "would_be_green": bool(net > 0),
     }
 

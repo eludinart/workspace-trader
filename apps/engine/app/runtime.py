@@ -11,6 +11,7 @@ from app.config import AlertParams, BotParams
 from app.events import EventBus
 from app.lease import read_lease
 from app.execution import OrderPlan, buy_spend, cooldown_active, plan_protective, plan_signal
+from app.fill_model import impact_bps_for_notional, quote_fill
 from app.journal import DecisionJournal
 from app.market.coinbase import CoinbaseClient
 from app.narrative import decision_narrative, format_other_exits, thresholds_from_detail
@@ -26,11 +27,13 @@ from app.risk import (
     risk_position_spend,
     sell_is_net_positive,
 )
+from app.signals.flags import SignalFeatureFlags
+from app.signals.post_trade import run_post_trade_review
 from app.strategy.features import build_feature_frame
 from app.strategy.xgboost_strategy import SignalResult, XGBoostStrategy
 from app.trading_style import apply_style_preset, normalize_style, scan_gates
 from app.universe import UniverseService
-from app.wallet import PaperWallet, Trade
+from app.wallet import PaperWallet, Trade, annotate_trade_for_display
 
 if TYPE_CHECKING:
     from app.lease import LeaseManager
@@ -174,7 +177,7 @@ class TradingRuntime:
                     {"symbol": p.symbol, "qty": p.qty, "avg_entry": p.avg_entry}
                     for p in self.wallet.positions.values()
                 ],
-                "trades": [t.to_dict() for t in self.wallet.trades[-200:]],
+                "trades": [annotate_trade_for_display(t) for t in self.wallet.trades[-200:]],
             },
             "journal": [e.to_dict() for e in self.journal.entries[-200:]],
             "signal_history": self.signal_history[-50:],
@@ -561,7 +564,7 @@ class TradingRuntime:
             "price": self.last_price,
             "signal": self.signal_view(),
             "decisions": self.decision_feed(),
-            "trades": [t.to_dict() for t in reversed(self.wallet.trades[-30:])],
+            "trades": [annotate_trade_for_display(t) for t in reversed(self.wallet.trades[-30:])],
             "journal": self.journal.list(limit=40, source="live"),
             "news": self.news.brief_dict(),
             "universe": {
@@ -685,10 +688,72 @@ class TradingRuntime:
         return result
 
     def _apply_slippage(self, side: str, price: float) -> float:
-        slip = self.params.slippage_bps / 10_000.0
-        if side == "buy":
-            return price * (1.0 + slip)
-        return price * (1.0 - slip)
+        """Backward-compatible slip-only helper (no latency/impact)."""
+        q = quote_fill(side, price, slip_bps=self.params.slippage_bps, latency_ms=0)
+        return q.fill_price
+
+    def signal_flags(self) -> SignalFeatureFlags:
+        return SignalFeatureFlags(
+            confluence_enabled=bool(self.params.confluence_enabled),
+            mtf_enabled=bool(self.params.mtf_enabled),
+            kelly_enabled=bool(self.params.kelly_enabled),
+            onchain_enabled=bool(self.params.onchain_enabled),
+            super_opp_enabled=bool(self.params.super_opp_enabled),
+            passive_wake_enabled=bool(self.params.passive_wake_enabled),
+            post_trade_ai_enabled=bool(self.params.post_trade_ai_enabled),
+            web_push_enabled=bool(self.params.web_push_enabled),
+        )
+
+    def _build_fill_quote(self, side: str, decision_price: float, *, notional: float) -> Any:
+        if self.params.latency_wall_clock and self.params.latency_ms > 0:
+            time.sleep(self.params.latency_ms / 1000.0)
+        fill_mid = decision_price
+        # After simulated latency, refresh mark when possible (adverse path).
+        # Caller may pass a symbol via prices; we keep mid unless wall-clock refreshed.
+        impact = impact_bps_for_notional(
+            notional,
+            enabled=bool(self.params.order_impact_enabled),
+            equity=max(self._equity(), 1.0),
+            max_impact_bps=float(self.params.impact_bps_max),
+        )
+        return quote_fill(
+            side,
+            decision_price,
+            slip_bps=float(self.params.slippage_bps),
+            latency_ms=int(self.params.latency_ms),
+            impact_bps=impact,
+            fill_mid=fill_mid,
+        )
+
+    def _maybe_post_trade_review(self, trade: Trade) -> None:
+        if trade.side != "sell":
+            return
+        flags = self.signal_flags()
+        if not flags.post_trade_ai_enabled:
+            return
+
+        def _append(payload: dict[str, Any]) -> None:
+            # Soft journal note — never mutates wallet / PnL.
+            self.journal.add(
+                symbol=trade.symbol,
+                action="review",
+                price=float(trade.price),
+                qty=float(trade.qty),
+                trade_id=trade.id,
+                confidence=0.0,
+                features={},
+                top_features=[],
+                explanation=str((payload.get("review") or {}).get("comment") or ""),
+                note="post_trade_review",
+                narrative=str((payload.get("review") or {}).get("comment") or ""),
+            )
+
+        run_post_trade_review(
+            enabled=True,
+            trade=trade.to_dict(),
+            context={},
+            append_journal=_append,
+        )
 
     def _check_auto_kill(self, equity: float) -> None:
         if not self.params.kill_switch_enabled or self.killed:
@@ -765,16 +830,26 @@ class TradingRuntime:
         qty = min(qty, pos.qty)
         if pos.qty - qty < 1e-8:
             qty = pos.qty
-        fill = self._apply_slippage("sell", price)
+        q = self._build_fill_quote("sell", price, notional=qty * price)
         try:
             trade = self.wallet.sell(
-                symbol, qty=qty, price=fill, fee_bps=self.params.fee_bps, note=note
+                symbol,
+                qty=qty,
+                price=q.fill_price,
+                fee_bps=self.params.fee_bps,
+                note=note,
+                decision_ts=q.decision_ts,
+                decision_price=q.decision_price,
+                latency_ms=q.latency_ms,
+                slip_bps=q.slip_bps,
+                impact_bps=q.impact_bps,
             )
         except ValueError:
             logger.warning("sell failed %s", symbol)
             return None
         if self.wallet.get_position(symbol) is None:
             self._exit_levels.pop(symbol, None)
+        self._maybe_post_trade_review(trade)
         return trade
 
     def _levels_for(self, symbol: str) -> tuple[float, float]:
@@ -966,6 +1041,7 @@ class TradingRuntime:
                 floor_stop_pct=max(0.008, float(self.params.stop_loss_pct) * 0.5),
                 cap_stop_pct=0.04,
             )
+            # Slip-only provisional fill for sizing (no wall-clock sleep / impact).
             fill = self._apply_slippage("buy", price)
             risk_spend = risk_position_spend(
                 equity,
@@ -989,11 +1065,22 @@ class TradingRuntime:
             fee_mult = 1.0 + self.params.fee_bps / 10_000.0
             if spend < 15 or fill <= 0:
                 return None, OrderPlan("hold", 0.0, "budget", "hold:budget")
+            q = self._build_fill_quote("buy", price, notional=spend)
+            fill = q.fill_price
             qty = spend / (fill * fee_mult)
             self._require_fill_authority()
             try:
                 trade = self.wallet.buy(
-                    symbol, qty=qty, price=fill, fee_bps=self.params.fee_bps, note=plan.note
+                    symbol,
+                    qty=qty,
+                    price=fill,
+                    fee_bps=self.params.fee_bps,
+                    note=plan.note,
+                    decision_ts=q.decision_ts,
+                    decision_price=q.decision_price,
+                    latency_ms=q.latency_ms,
+                    slip_bps=q.slip_bps,
+                    impact_bps=q.impact_bps,
                 )
             except ValueError:
                 return None, OrderPlan("hold", 0.0, "budget", "hold:budget")
@@ -1656,12 +1743,14 @@ class TradingRuntime:
         for row in snap.get("positions") or []:
             if not isinstance(row, dict):
                 continue
+            cost_basis = row.get("cost_basis")
             net = net_pnl_if_closed(
                 float(row.get("avg_entry") or 0),
                 float(row.get("qty") or 0),
                 float(row.get("mark_price") or 0),
                 fee_bps=float(self.params.fee_bps),
                 slippage_bps=float(self.params.slippage_bps),
+                cost_basis=float(cost_basis) if cost_basis is not None else None,
             )
             enriched.append(
                 {
@@ -1671,6 +1760,7 @@ class TradingRuntime:
                     "net_pnl_pct": net["net_pnl_pct"],
                     "fees_total": net["fees_total"],
                     "would_be_green": net["would_be_green"],
+                    "mark_ts": row.get("mark_ts"),
                 }
             )
         snap["positions"] = enriched
@@ -1683,6 +1773,10 @@ class TradingRuntime:
             **snap,
             "fee_bps": self.params.fee_bps,
             "slippage_bps": self.params.slippage_bps,
+            "latency_ms": self.params.latency_ms,
+            "order_impact_enabled": self.params.order_impact_enabled,
+            "marks_as_of": datetime.now(timezone.utc).isoformat(),
+            "signal_flags": self.signal_flags().as_dict(),
             "symbol": self.params.symbol,
             "symbols": self.watchlist(),
             "active_symbol": self.active_symbol,
