@@ -1,4 +1,4 @@
-import { NewsBrief, normalizeNewsBrief } from "@/lib/news";
+import { NewsBrief, isUsableNewsBrief, normalizeNewsBrief } from "@/lib/news";
 
 export type FeatureState = "ok" | "warn" | "off" | "error";
 
@@ -194,7 +194,8 @@ export async function fetchNewsBrief(): Promise<NewsFetchResult> {
     if (!res.ok) continue;
     const json: unknown = await res.json();
     const brief = normalizeNewsBrief(json);
-    if (brief) return { brief, loading: false };
+    // Ignore empty shells (e.g. /news before first RSS pull, or brief with 0 titles).
+    if (isUsableNewsBrief(brief)) return { brief, loading: false };
   }
   return { brief: null, loading: true };
 }

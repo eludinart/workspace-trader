@@ -47,6 +47,30 @@ function plainSnippet(raw: string, title: string): string | undefined {
   return `${text.slice(0, 217).trimEnd()}…`;
 }
 
+function parseHeadlineList(raw: unknown): NewsHeadline[] {
+  if (!Array.isArray(raw)) return [];
+  const parsed: NewsHeadline[] = [];
+  for (const h of raw) {
+    if (!h || typeof h !== "object") continue;
+    const item = h as Record<string, unknown>;
+    if (typeof item.title !== "string" || typeof item.link !== "string") continue;
+    if (!item.title.trim() || !item.link.trim()) continue;
+    const headline: NewsHeadline = {
+      title: item.title,
+      link: item.link,
+      category: typeof item.category === "string" ? item.category : "general",
+    };
+    if (typeof item.published === "string") headline.published = item.published;
+    if (typeof item.score === "number") headline.score = item.score;
+    if (typeof item.summary === "string") {
+      const snippet = plainSnippet(item.summary, item.title);
+      if (snippet) headline.summary = snippet;
+    }
+    parsed.push(headline);
+  }
+  return parsed;
+}
+
 export function normalizeNewsBrief(raw: unknown): NewsBrief | null {
   if (!raw || typeof raw !== "object") return null;
   const o = raw as Record<string, unknown>;
@@ -60,29 +84,8 @@ export function normalizeNewsBrief(raw: unknown): NewsBrief | null {
       if (v != null) categories[key] = v;
     }
   }
-  const headlinesRaw = o.headlines;
-  let headlines: NewsHeadline[] | undefined;
-  if (Array.isArray(headlinesRaw)) {
-    const parsed: NewsHeadline[] = [];
-    for (const h of headlinesRaw) {
-      if (!h || typeof h !== "object") continue;
-      const item = h as Record<string, unknown>;
-      if (typeof item.title !== "string" || typeof item.link !== "string") continue;
-      const headline: NewsHeadline = {
-        title: item.title,
-        link: item.link,
-        category: typeof item.category === "string" ? item.category : "general",
-      };
-      if (typeof item.published === "string") headline.published = item.published;
-      if (typeof item.score === "number") headline.score = item.score;
-      if (typeof item.summary === "string") {
-        const snippet = plainSnippet(item.summary, item.title);
-        if (snippet) headline.summary = snippet;
-      }
-      parsed.push(headline);
-    }
-    headlines = parsed;
-  }
+  // /news/brief uses `headlines`; /news list uses `items`.
+  const headlines = parseHeadlineList(o.headlines ?? o.items);
   const overall =
     readScore(o.overall_score) ??
     readScore(o.overallScore) ??
@@ -96,10 +99,41 @@ export function normalizeNewsBrief(raw: unknown): NewsBrief | null {
   };
 }
 
+/** True when the brief has titles to show (or real category scores). */
+export function isUsableNewsBrief(brief: NewsBrief | null | undefined): boolean {
+  if (!brief) return false;
+  if ((brief.headlines?.length ?? 0) > 0) return true;
+  const cats = brief.categories;
+  if (!cats) return false;
+  return CATEGORY_KEYS.some((key) => {
+    const v = cats[key];
+    return typeof v === "number" && Number.isFinite(v) && v !== 0;
+  });
+}
+
+/** Keep a populated brief when a later empty stream frame would wipe the UI. */
+export function pickRicherNewsBrief(
+  current: NewsBrief | null | undefined,
+  incoming: NewsBrief | null | undefined,
+): NewsBrief | null {
+  const nextOk = isUsableNewsBrief(incoming);
+  const curOk = isUsableNewsBrief(current);
+  if (nextOk) return incoming ?? null;
+  if (curOk) return current ?? null;
+  return incoming ?? current ?? null;
+}
+
 export function newsFromStreamPayload(data: Record<string, unknown>): NewsBrief | null {
   if (data.news_brief != null) return normalizeNewsBrief(data.news_brief);
   if (data.news != null) return normalizeNewsBrief(data.news);
-  if (data.overall_score != null || data.categories != null || data.headlines != null) {
+  if (
+    data.overall_score != null ||
+    data.overall_bias != null ||
+    data.categories != null ||
+    data.scores != null ||
+    data.headlines != null ||
+    data.items != null
+  ) {
     return normalizeNewsBrief(data);
   }
   return null;

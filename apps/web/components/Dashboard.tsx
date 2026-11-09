@@ -51,7 +51,13 @@ import {
   type SystemStatusPayload,
   type UniversePayload,
 } from "@/lib/engine";
-import { NewsBrief, newsBias, newsFromStreamPayload } from "@/lib/news";
+import {
+  NewsBrief,
+  isUsableNewsBrief,
+  newsBias,
+  newsFromStreamPayload,
+  pickRicherNewsBrief,
+} from "@/lib/news";
 import { actionLabel } from "@/lib/signal-fr";
 
 function mapApiCandle(c: {
@@ -267,8 +273,8 @@ export function Dashboard() {
     setBtStart(start.toISOString().slice(0, 10));
     void refresh();
     void fetchNewsBrief().then(({ brief, loading }) => {
-      setNewsBrief(brief);
-      setNewsLoading(loading);
+      setNewsBrief((prev) => pickRicherNewsBrief(prev, brief));
+      setNewsLoading(loading && !isUsableNewsBrief(brief));
     });
   }, [refresh]);
 
@@ -277,15 +283,19 @@ export function Dashboard() {
     const poll = () => {
       void fetchNewsBrief().then(({ brief, loading }) => {
         if (cancelled) return;
-        setNewsBrief(brief);
-        setNewsLoading(loading);
+        setNewsBrief((prev) => pickRicherNewsBrief(prev, brief));
+        if (isUsableNewsBrief(brief)) setNewsLoading(false);
+        else if (!newsFromStreamRef.current) setNewsLoading(loading);
       });
     };
+    // First poll soon after mount in case the stream sent an empty news shell.
+    const boot = setTimeout(poll, 2500);
     const timer = setInterval(() => {
       if (!newsFromStreamRef.current) poll();
     }, 60_000);
     return () => {
       cancelled = true;
+      clearTimeout(boot);
       clearInterval(timer);
     };
   }, []);
@@ -319,9 +329,15 @@ export function Dashboard() {
         if (data.type === "heartbeat") return;
         const streamNews = newsFromStreamPayload(data as Record<string, unknown>);
         if (streamNews) {
-          newsFromStreamRef.current = true;
-          setNewsBrief(streamNews);
-          setNewsLoading(false);
+          // Never let an empty early snapshot wipe a good poll, and keep polling
+          // until we have actually received usable headlines from the stream.
+          if (isUsableNewsBrief(streamNews)) {
+            newsFromStreamRef.current = true;
+            setNewsBrief(streamNews);
+            setNewsLoading(false);
+          } else {
+            setNewsBrief((prev) => pickRicherNewsBrief(prev, streamNews));
+          }
         }
         if (data.account) {
           setAccount(data.account);
