@@ -115,6 +115,9 @@ class BotParams(BaseModel):
     passive_wake_enabled: bool = False
     post_trade_ai_enabled: bool = False
     web_push_enabled: bool = False
+    # LLM co-pilot (approve/veto/resize/force_exit). Default off until keys + flag.
+    copilot_enabled: bool = False
+    copilot_review_interval_sec: int = Field(default=180, ge=60, le=3600)
     kill_switch_enabled: bool = True
     max_daily_loss_pct: float = Field(default=5.0, ge=0.1, le=100)
     max_drawdown_pct: float = Field(default=15.0, ge=0.1, le=100)

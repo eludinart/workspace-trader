@@ -207,6 +207,8 @@ class ParamsUpdate(BaseModel):
     passive_wake_enabled: bool | None = None
     post_trade_ai_enabled: bool | None = None
     web_push_enabled: bool | None = None
+    copilot_enabled: bool | None = None
+    copilot_review_interval_sec: int | None = Field(default=None, ge=60, le=3600)
     kill_switch_enabled: bool | None = None
     max_daily_loss_pct: float | None = None
     max_drawdown_pct: float | None = None

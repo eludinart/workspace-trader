@@ -15,6 +15,7 @@ from app.execution import OrderPlan, buy_spend, cooldown_active, plan_protective
 from app.fidelity import FillSample, FidelityTracker
 from app.fill_model import impact_bps_for_notional, quote_fill, walk_book_fill, walk_real_book
 from app.journal import DecisionJournal
+from app.llm.copilot import CopilotDecision, CopilotService
 from app.market.coinbase import CoinbaseClient
 from app.narrative import decision_narrative, format_other_exits, thresholds_from_detail
 from app.news.service import NewsService
@@ -27,6 +28,7 @@ from app.risk import (
     net_pnl_if_closed,
     portfolio_open_risk_r,
     risk_position_spend,
+    round_trip_cost_frac,
     sell_is_net_positive,
 )
 from app.signals.flags import SignalFeatureFlags, env_flag_overrides
@@ -71,6 +73,8 @@ _NOTE_REASONS = {
     "hold:fee_guard": "fee_guard",
     "hold:min_hold": "min_hold",
     "hold:portfolio_risk": "portfolio_risk",
+    "hold:copilot_veto": "copilot_veto",
+    "exit:copilot": "copilot",
 }
 
 
@@ -90,7 +94,7 @@ class TradingRuntime:
         self.store = store
         self.lease = lease
         self._db_ok = store is None
-        self.params = BotParams()
+        self.params = self._apply_env_signal_flags(BotParams())
         self.wallet = PaperWallet(initial_balance=self.params.initial_balance)
         self.market = CoinbaseClient()
         self.strategy = XGBoostStrategy()
@@ -137,6 +141,10 @@ class TradingRuntime:
         self._universe_signals: dict[str, dict[str, Any]] = {}
         self.equity_history = EquityHistory()
         self._last_equity_persist_mono: float = 0.0
+        self.copilot = CopilotService()
+        self._last_copilot_book_review_mono: float = 0.0
+        self._copilot_entry_mono: dict[str, float] = {}
+        self._last_copilot_by_symbol: dict[str, CopilotDecision] = {}
         if store is None:
             self._restore_persisted_state()
 
@@ -229,12 +237,31 @@ class TradingRuntime:
         self._db_ok = True
 
     def _apply_env_signal_flags(self, params: BotParams) -> BotParams:
-        """Overlay Coolify SIGNAL_* / WEB_PUSH_ENABLED when explicitly set."""
+        """Overlay Coolify SIGNAL_* / WEB_PUSH_ENABLED / COPILOT_* when explicitly set."""
         overrides = env_flag_overrides(os.getenv)
-        if not overrides:
-            return params
         data = params.model_dump()
-        data.update(overrides)
+        changed = False
+        if overrides:
+            data.update(overrides)
+            changed = True
+        raw_copilot = os.getenv("COPILOT_ENABLED")
+        if raw_copilot is not None and str(raw_copilot).strip() != "":
+            data["copilot_enabled"] = str(raw_copilot).strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
+            changed = True
+        raw_interval = os.getenv("COPILOT_REVIEW_INTERVAL_SEC")
+        if raw_interval is not None and str(raw_interval).strip() != "":
+            try:
+                data["copilot_review_interval_sec"] = int(str(raw_interval).strip())
+                changed = True
+            except ValueError:
+                pass
+        if not changed:
+            return params
         return BotParams(**data)
 
     def _reload_params_only(self) -> None:
@@ -1046,6 +1073,191 @@ class TradingRuntime:
             return float(stored["take_pct"]), float(stored["stop_pct"])
         return float(self.params.take_profit_pct), float(self.params.stop_loss_pct)
 
+    def _copilot_active(self) -> bool:
+        return self.copilot.enabled(bool(self.params.copilot_enabled))
+
+    def _copilot_entry_allowed(self, symbol: str) -> bool:
+        """Rate-limit: at most one entry review per symbol per 20s."""
+        last = self._copilot_entry_mono.get(symbol)
+        if last is None:
+            return True
+        return (time.monotonic() - last) >= 20.0
+
+    def _copilot_context(
+        self,
+        *,
+        symbol: str,
+        signal: SignalResult | None,
+        side: str,
+        price: float,
+        proposed_notional: float | None = None,
+    ) -> dict[str, Any]:
+        pos = self.wallet.get_position(symbol)
+        equity = self._equity()
+        take_pct, stop_pct = self._levels_for(symbol)
+        brief = self.news.cached_brief()
+        headlines = getattr(brief, "headlines", ()) or ()
+        top_headline = ""
+        if headlines:
+            first = headlines[0]
+            top_headline = str(getattr(first, "title", None) or first)[:160]
+        news_bias = float(
+            getattr(brief, "overall_bias", getattr(brief, "overall_score", 0.0)) or 0.0
+        )
+        feats = signal.features if signal is not None else {}
+        probs = signal.probs if signal is not None else {}
+        conf = float(signal.confidence) if signal is not None else 0.0
+        u_pnl_pct = 0.0
+        qty = 0.0
+        avg = 0.0
+        if pos is not None and pos.avg_entry > 0:
+            qty = float(pos.qty)
+            avg = float(pos.avg_entry)
+            u_pnl_pct = ((float(price) - avg) / avg) * 100.0
+        dist_tp = None
+        dist_sl = None
+        if avg > 0:
+            tp_px = avg * (1.0 + take_pct)
+            sl_px = avg * (1.0 - stop_pct)
+            dist_tp = ((tp_px - float(price)) / float(price)) * 100.0 if price else None
+            dist_sl = ((float(price) - sl_px) / float(price)) * 100.0 if price else None
+        rt_bps = round_trip_cost_frac(self.params.fee_bps, self.params.slippage_bps) * 10_000.0
+        return {
+            "symbol": symbol,
+            "side_proposed": side,
+            "confidence": conf,
+            "probs": {k: float(v) for k, v in (probs or {}).items()},
+            "rsi": float(feats.get("rsi", 50.0) or 50.0),
+            "macd_hist": float(feats.get("macd_hist", 0.0) or 0.0),
+            "news_bias": news_bias,
+            "top_headline": top_headline,
+            "position_qty": qty,
+            "avg_entry": avg,
+            "u_pnl_pct": round(u_pnl_pct, 3),
+            "equity": round(equity, 2),
+            "cash": round(float(self.wallet.cash), 2),
+            "dist_tp_pct": None if dist_tp is None else round(dist_tp, 3),
+            "dist_sl_pct": None if dist_sl is None else round(dist_sl, 3),
+            "rt_friction_bps": round(rt_bps, 1),
+            "style": self.params.trading_style,
+            "open_symbols": len(self.wallet.positions),
+            "proposed_notional": (
+                None if proposed_notional is None else round(float(proposed_notional), 2)
+            ),
+            "price": float(price),
+        }
+
+    def _apply_copilot_entry(
+        self,
+        *,
+        symbol: str,
+        signal: SignalResult,
+        side: str,
+        price: float,
+        proposed_notional: float,
+    ) -> CopilotDecision | None:
+        """Review an actionable entry/exit. None = soft skip (rate limit / off)."""
+        if not self._copilot_active():
+            return None
+        if not self._copilot_entry_allowed(symbol):
+            return None
+        ctx = self._copilot_context(
+            symbol=symbol,
+            signal=signal,
+            side=side,
+            price=price,
+            proposed_notional=proposed_notional,
+        )
+        self._copilot_entry_mono[symbol] = time.monotonic()
+        decision = self.copilot.review_entry(ctx)
+        self._last_copilot_by_symbol[symbol] = decision
+        if decision.soft_fail:
+            self.journal.add(
+                symbol=symbol,
+                action="copilot",
+                price=float(price),
+                qty=0.0,
+                trade_id=None,
+                confidence=float(signal.confidence),
+                features={},
+                top_features=[],
+                explanation=decision.reason_fr,
+                note="copilot_soft_fail",
+                narrative=f"Co-pilote : {decision.reason_fr}",
+            )
+        return decision
+
+    def _copilot_review_book(self) -> list[dict[str, Any]]:
+        """Periodic open-book review; may force_exit within risk caps."""
+        exits: list[dict[str, Any]] = []
+        if not self._copilot_active() or self.killed or not self.params.auto_trade:
+            return exits
+        interval = max(60, int(self.params.copilot_review_interval_sec))
+        now_mono = time.monotonic()
+        if self._last_copilot_book_review_mono and (
+            now_mono - self._last_copilot_book_review_mono
+        ) < interval:
+            return exits
+        self._last_copilot_book_review_mono = now_mono
+        for sym in list(self.wallet.positions.keys()):
+            pos = self.wallet.get_position(sym)
+            if pos is None:
+                continue
+            price = self.prices.get(sym)
+            if price is None:
+                price = self._cache_ticker(sym)
+            if price is None:
+                continue
+            ctx = self._copilot_context(
+                symbol=sym,
+                signal=None,
+                side="review",
+                price=float(price),
+                proposed_notional=float(pos.market_value(float(price))),
+            )
+            decision = self.copilot.review_position(ctx)
+            self._last_copilot_by_symbol[sym] = decision
+            if decision.soft_fail:
+                self.journal.add(
+                    symbol=sym,
+                    action="copilot",
+                    price=float(price),
+                    qty=0.0,
+                    trade_id=None,
+                    confidence=0.0,
+                    features={},
+                    top_features=[],
+                    explanation=decision.reason_fr,
+                    note="copilot_soft_fail",
+                    narrative=f"Co-pilote : {decision.reason_fr}",
+                )
+                continue
+            if decision.action != "force_exit":
+                continue
+            trade = self._sell_qty(sym, pos.qty, float(price), "exit:copilot")
+            if trade is None:
+                continue
+            self._journal_fill(trade, None, "exit:copilot")
+            if self.journal.entries:
+                last = self.journal.entries[-1]
+                if last.note == "exit:copilot":
+                    suffix = f" Co-pilote : {decision.reason_fr}"
+                    if suffix.strip() not in (last.narrative or ""):
+                        last.narrative = f"{(last.narrative or '').strip()}{suffix}".strip()
+                    last.explanation = f"{last.explanation} | {decision.reason_fr}"
+            exits.append(
+                {
+                    "symbol": sym,
+                    "trade_id": trade.id,
+                    "reason": "copilot",
+                    "note": "exit:copilot",
+                    "price": trade.price,
+                    "qty": trade.qty,
+                    "copilot": decision.to_dict(),
+                }
+            )
+        return exits
+
     def _decision_narrative(
         self,
         *,
@@ -1106,6 +1318,13 @@ class TradingRuntime:
             order_placed=True,
             price=trade.price,
         )
+        copilot_snap = self._last_copilot_by_symbol.get(trade.symbol)
+        if copilot_snap is not None and copilot_snap.reason_fr:
+            bit = f"Co-pilote : {copilot_snap.reason_fr}"
+            if bit not in narrative:
+                narrative = f"{narrative} {bit}"
+            if bit not in explanation:
+                explanation = f"{explanation} | {copilot_snap.reason_fr}"
         self.journal.add(
             symbol=trade.symbol,
             action=trade.side,
@@ -1269,6 +1488,19 @@ class TradingRuntime:
             fee_mult = 1.0 + self.params.fee_bps / 10_000.0
             if spend < 15 or fill <= 0:
                 return None, OrderPlan("hold", 0.0, "budget", "hold:budget")
+            copilot = self._apply_copilot_entry(
+                symbol=symbol,
+                signal=signal,
+                side="buy",
+                price=price,
+                proposed_notional=spend,
+            )
+            if copilot is not None and copilot.action == "veto":
+                return None, OrderPlan("hold", 0.0, "copilot_veto", "hold:copilot_veto")
+            if copilot is not None and copilot.action == "resize":
+                spend = spend * float(copilot.size_mult)
+                if spend < 15:
+                    return None, OrderPlan("hold", 0.0, "budget", "hold:budget")
             q = self._build_fill_quote("buy", ask_mark, notional=spend, symbol=symbol)
             if getattr(q, "rejected", False) or q.fill_price <= 0:
                 return None, OrderPlan(
@@ -1322,6 +1554,15 @@ class TradingRuntime:
             slippage_bps=self.params.slippage_bps,
         ):
             return None, OrderPlan("hold", 0.0, "fee_guard", "hold:fee_guard")
+        copilot = self._apply_copilot_entry(
+            symbol=symbol,
+            signal=signal,
+            side="sell",
+            price=price,
+            proposed_notional=pos_val,
+        )
+        if copilot is not None and copilot.action == "veto":
+            return None, OrderPlan("hold", 0.0, "copilot_veto", "hold:copilot_veto")
         plan = OrderPlan("sell", 1.0, "signal", "exit:signal")
         trade = self._sell_qty(symbol, pos.qty, price, plan.note)
         if trade is None:
@@ -1345,6 +1586,7 @@ class TradingRuntime:
         exits: list[dict[str, Any]] = []
         if self.params.auto_trade and not self.killed:
             exits = self._protect_positions()
+            exits.extend(self._copilot_review_book())
 
         price = self.prices.get(symbol)
         if price is None:
@@ -1441,6 +1683,11 @@ class TradingRuntime:
             order_placed=order_placed,
             price=price,
         )
+        copilot_snap = self._last_copilot_by_symbol.get(symbol)
+        if copilot_snap is not None and copilot_snap.reason_fr:
+            bit = f"Co-pilote : {copilot_snap.reason_fr}"
+            if bit not in narrative:
+                narrative = f"{narrative} {bit}"
         extra_exits = format_other_exits(exits, symbol)
         if extra_exits:
             narrative = f"{narrative} {extra_exits}"
@@ -1457,6 +1704,7 @@ class TradingRuntime:
                 "order_placed": order_placed,
                 "buy_threshold": buy_th,
                 "sell_threshold": sell_th,
+                "copilot": copilot_snap.to_dict() if copilot_snap else None,
             },
             "exits": exits,
             "train": train_info,
@@ -1973,6 +2221,17 @@ class TradingRuntime:
             "Positions ouvertes",
             "ok" if open_n > 0 else "off",
             f"{open_n} position(s) · cash {self.wallet.cash:,.2f} $",
+        )
+
+        copilot_state, copilot_detail = self.copilot.status_state(
+            bool(self.params.copilot_enabled)
+        )
+        interval = int(self.params.copilot_review_interval_sec)
+        add(
+            "copilot",
+            "Co-pilote LLM",
+            copilot_state,
+            f"{copilot_detail} · revue livre {interval}s",
         )
 
         ranks = {"ok": 0, "off": 1, "warn": 2, "error": 3}
