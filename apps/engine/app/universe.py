@@ -30,6 +30,25 @@ _STABLE_BASES = {
 }
 _SKIP_BASES = {"WBTC", "CBETH", "WETH", "STETH", "TBTC", "CBBTC"}
 
+# Hyper-penny / coarse-tick memes that repeatedly bleed paper via slip ≫ SL.
+_DENY_BASES = {
+    "MOG",
+    "NOICE",
+    "NEX",
+    "BNKR",
+    "DRB",
+    "SPELL",
+    "DEGEN",
+    "TOSHI",
+}
+
+
+def tick_size_bps(quote_increment: float, ref_price: float) -> float:
+    """One quote tick as a fraction of price, in basis points."""
+    if ref_price <= 0 or quote_increment < 0:
+        return 1e9
+    return float(quote_increment) / float(ref_price) * 10_000.0
+
 
 @dataclass(frozen=True)
 class UniverseRow:
@@ -38,6 +57,7 @@ class UniverseRow:
     volume_24h: float
     rank: int
     source: str = "volume"  # volume | news | core
+    quote_increment: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -46,6 +66,7 @@ class UniverseRow:
             "volume_24h": self.volume_24h,
             "rank": self.rank,
             "source": self.source,
+            "quote_increment": self.quote_increment,
         }
 
 
@@ -63,8 +84,12 @@ class UniverseService:
 
     market: CoinbaseClient
     size: int = 50
-    min_volume_usd: float = 1_000_000.0
+    min_volume_usd: float = 15_000_000.0
     refresh_hours: float = 6.0
+    # Reject products whose quote tick alone is wider than this many bps of a
+    # heuristic mid (quote_increment × 1e4 as synthetic mid when price unknown).
+    max_tick_bps: float = 40.0
+    min_ref_price: float = 1e-4
     core: list[str] = field(default_factory=lambda: ["BTC-USD", "ETH-USD", "SOL-USD"])
     news_ttl_hours: float = 12.0
     rows: list[UniverseRow] = field(default_factory=list)
@@ -72,6 +97,7 @@ class UniverseService:
     updated_at: datetime | None = None
     last_error: str | None = None
     online_usd: set[str] = field(default_factory=set)
+    quote_increments: dict[str, float] = field(default_factory=dict)
     _news_boosts: dict[str, _NewsBoost] = field(default_factory=dict)
     news_hits: list[dict[str, Any]] = field(default_factory=list)
 
@@ -79,9 +105,40 @@ class UniverseService:
         self.size = max(10, min(80, int(self.size)))
         self.min_volume_usd = max(0.0, float(self.min_volume_usd))
         self.refresh_hours = max(1.0, float(self.refresh_hours))
+        self.max_tick_bps = max(5.0, float(self.max_tick_bps))
+        self.min_ref_price = max(0.0, float(self.min_ref_price))
         self.core = [s.strip().upper() for s in self.core if str(s).strip()]
         if not self.symbols:
             self.symbols = list(self.core)
+
+    def is_symbol_allowed(
+        self,
+        symbol: str,
+        *,
+        price: float | None = None,
+        volume_24h: float | None = None,
+    ) -> bool:
+        """Shared gate for volume book, news boosts, and live entries."""
+        sym = str(symbol or "").strip().upper()
+        if not sym.endswith("-USD"):
+            return False
+        base = sym.split("-")[0]
+        if base in _STABLE_BASES or base in _SKIP_BASES or base in _DENY_BASES:
+            return False
+        if volume_24h is not None and float(volume_24h) < self.min_volume_usd:
+            if sym not in self.core:
+                return False
+        if price is None:
+            return True
+        ref = float(price)
+        if ref <= 0:
+            return False
+        if ref < self.min_ref_price and sym not in self.core:
+            return False
+        qi = float(self.quote_increments.get(sym, 0.0) or 0.0)
+        if qi > 0 and tick_size_bps(qi, ref) > self.max_tick_bps:
+            return False
+        return True
 
     def stale(self) -> bool:
         if self.updated_at is None or not self.rows:
@@ -130,6 +187,13 @@ class UniverseService:
         for hit in hits:
             # If we have no product catalog yet, still accept common USD pairs.
             if self.online_usd and hit.symbol not in self.online_usd:
+                continue
+            # News must not re-inject denied / coarse-tick / sub-floor names.
+            if not self.is_symbol_allowed(hit.symbol):
+                continue
+            # Prefer names already in the liquid volume book (or core).
+            in_book = hit.symbol in self.core or any(r.symbol == hit.symbol for r in self.rows)
+            if self.rows and not in_book:
                 continue
             prev = self._news_boosts.get(hit.symbol)
             self._news_boosts[hit.symbol] = _NewsBoost(
@@ -198,6 +262,10 @@ class UniverseService:
 
     def _merge_symbols(self) -> list[str]:
         self._expire_news()
+        # Drop stale news boosts that no longer pass quality gates.
+        for sym in list(self._news_boosts):
+            if not self.is_symbol_allowed(sym):
+                self._news_boosts.pop(sym, None)
         ordered: list[str] = []
         seen: set[str] = set()
         for core in self.core:
@@ -206,11 +274,13 @@ class UniverseService:
                 seen.add(core)
         # News boosts first after core so they get scanned sooner.
         for sym in sorted(self._news_boosts, key=lambda s: abs(self._news_boosts[s].score), reverse=True):
-            if sym not in seen:
+            if sym not in seen and self.is_symbol_allowed(sym):
                 ordered.append(sym)
                 seen.add(sym)
         for row in self.rows:
-            if row.symbol not in seen:
+            if row.symbol not in seen and self.is_symbol_allowed(
+                row.symbol, volume_24h=row.volume_24h
+            ):
                 ordered.append(row.symbol)
                 seen.add(row.symbol)
             if len(ordered) >= self.size + len(self._news_boosts):
@@ -226,6 +296,7 @@ class UniverseService:
         self, products: list[dict[str, Any]], volumes: list[dict[str, Any]]
     ) -> list[UniverseRow]:
         online_usd: dict[str, str] = {}
+        quote_incs: dict[str, float] = {}
         for p in products:
             pid = str(p.get("id") or "").upper()
             if not pid.endswith("-USD"):
@@ -235,13 +306,19 @@ class UniverseService:
             if p.get("trading_disabled") is True:
                 continue
             base = str(p.get("base_currency") or pid.split("-")[0]).upper()
-            if base in _STABLE_BASES or base in _SKIP_BASES:
+            if base in _STABLE_BASES or base in _SKIP_BASES or base in _DENY_BASES:
                 continue
             quote = str(p.get("quote_currency") or "USD").upper()
             if quote != "USD":
                 continue
+            try:
+                qi = float(p.get("quote_increment") or 0)
+            except (TypeError, ValueError):
+                qi = 0.0
+            quote_incs[pid] = qi
             online_usd[pid] = base
         self.online_usd = set(online_usd)
+        self.quote_increments = quote_incs
 
         vol_map: dict[str, float] = {}
         for item in volumes:
@@ -254,6 +331,8 @@ class UniverseService:
             except (TypeError, ValueError):
                 vol = 0.0
             if vol < self.min_volume_usd:
+                continue
+            if not self.is_symbol_allowed(pid, volume_24h=vol):
                 continue
             vol_map[pid] = vol
 
@@ -281,6 +360,7 @@ class UniverseService:
                     volume_24h=vol,
                     rank=i,
                     source=source,
+                    quote_increment=float(quote_incs.get(pid, 0.0)),
                 )
             )
         return rows

@@ -51,3 +51,6 @@ htmlcov/
 # Paper trading runtime state
 apps/engine/data/
 !apps/engine/data/.gitkeep
+
+# Local agent scratch / SDD archives (not app code)
+.superpowers/

@@ -1471,21 +1471,21 @@ class TradingRuntime:
         return entry
 
     def _symbol_tradeable(self, symbol: str, price: float) -> bool:
-        """Prefer liquid majors / top volume; reject broken or dust prices."""
-        if price <= 0 or price < 1e-8:
+        """Liquid book only: volume floor + deny-list + tick-size vs live mid."""
+        if price <= 0:
+            return False
+        self.universe.min_volume_usd = float(self.params.universe_min_volume_usd)
+        row = next((r for r in self.universe.rows if r.symbol == symbol), None)
+        vol = float(row.volume_24h) if row is not None else None
+        if not self.universe.is_symbol_allowed(symbol, price=float(price), volume_24h=vol):
             return False
         core = {"BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD", "LINK-USD", "AVAX-USD", "DOGE-USD", "ADA-USD"}
         if symbol in core:
             return True
-        if any(h.get("symbol") == symbol for h in self.universe.news_hits):
-            return True
-        row = next((r for r in self.universe.rows if r.symbol == symbol), None)
         if row is None:
             return False
-        # Top half of the volume book only — skip illiquid meme tails.
-        return int(row.rank) <= max(15, int(self.params.universe_size) // 3) and float(
-            row.volume_24h or 0
-        ) >= float(self.params.universe_min_volume_usd)
+        # Top third of the volume book only — skip illiquid meme tails.
+        return int(row.rank) <= max(12, int(self.params.universe_size) // 3)
 
     def _scan_entry_bias(self, signal: SignalResult, symbol: str) -> SignalResult:
         """Style-aware scan entries (prudent / intermediaire / agressif)."""

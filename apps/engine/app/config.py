@@ -88,7 +88,7 @@ class BotParams(BaseModel):
     volume_ma_period: int = Field(default=20, ge=2)
     trading_style: TradingStyle = "intermediaire"
     # Defaults match intermediaire; switching trading_style reapplies the preset.
-    buy_threshold: float = Field(default=0.58, ge=0.2, le=1.0)
+    buy_threshold: float = Field(default=0.62, ge=0.2, le=1.0)
     sell_threshold: float = Field(default=0.50, ge=0.2, le=1.0)
     candle_granularity_sec: int = Field(default=3600, ge=60)
     candle_lookback: int = Field(default=300, ge=50, le=1000)
@@ -118,32 +118,32 @@ class BotParams(BaseModel):
     kill_switch_enabled: bool = True
     max_daily_loss_pct: float = Field(default=5.0, ge=0.1, le=100)
     max_drawdown_pct: float = Field(default=15.0, ge=0.1, le=100)
-    # TP above round-trip (~0.3%) but reachable; SL tighter to cut losers.
-    take_profit_pct: float = Field(default=0.018, ge=0, le=1)
-    stop_loss_pct: float = Field(default=0.009, ge=0, le=1)
+    # SL/TP must clear intro-taker round-trip (~180–220 bps) or expectancy dies.
+    take_profit_pct: float = Field(default=0.045, ge=0, le=1)
+    stop_loss_pct: float = Field(default=0.022, ge=0, le=1)
     # Concentrate capital on fewer, better lines (~15% equity max).
     max_position_pct: float = Field(default=0.15, gt=0, le=1)
     # Hard ceiling 2% capital/trade (AI / Kelly cannot raise this).
-    risk_per_trade_pct: float = Field(default=0.012, gt=0, le=0.02)
+    risk_per_trade_pct: float = Field(default=0.01, gt=0, le=0.02)
     # Paper order-book depth walk (lot 8); off keeps classic slip-only fills.
     order_book_depth_enabled: bool = False
     order_book_depth_levels: int = Field(default=5, ge=1, le=20)
     atr_stop_mult: float = Field(default=1.35, ge=1.0, le=4.0)
     reward_risk: float = Field(default=2.0, ge=1.0, le=5.0)
-    min_hold_min: int = Field(default=3, ge=0, le=24 * 60)
-    add_cooldown_min: int = Field(default=20, ge=0, le=24 * 60)
-    max_open_symbols: int = Field(default=6, ge=1, le=30)
-    capital_per_slot: float = Field(default=110.0, ge=20.0, le=500.0)
+    min_hold_min: int = Field(default=5, ge=0, le=24 * 60)
+    add_cooldown_min: int = Field(default=25, ge=0, le=24 * 60)
+    max_open_symbols: int = Field(default=4, ge=1, le=30)
+    capital_per_slot: float = Field(default=140.0, ge=20.0, le=500.0)
     max_open_hard_cap: int = Field(default=20, ge=5, le=50)
-    max_portfolio_risk_r: float = Field(default=6.0, ge=1.0, le=30.0)
+    max_portfolio_risk_r: float = Field(default=5.0, ge=1.0, le=30.0)
     universe_enabled: bool = True
-    universe_size: int = Field(default=40, ge=10, le=80)
-    universe_min_volume_usd: float = Field(default=2_000_000.0, ge=0)
+    universe_size: int = Field(default=30, ge=10, le=80)
+    universe_min_volume_usd: float = Field(default=15_000_000.0, ge=0)
     universe_refresh_hours: float = Field(default=6.0, ge=1.0, le=48.0)
-    aggressive_sell_confidence: float = Field(default=0.75, ge=0.5, le=1.0)
+    aggressive_sell_confidence: float = Field(default=0.70, ge=0.5, le=1.0)
     # XGB label window: horizon bars × move threshold (aligned with TP regime).
-    label_horizon_bars: int = Field(default=3, ge=1, le=48)
-    label_threshold_pct: float = Field(default=0.002, gt=0, le=0.2)
+    label_horizon_bars: int = Field(default=4, ge=1, le=48)
+    label_threshold_pct: float = Field(default=0.045, gt=0, le=0.2)
     label_path_aware: bool = True
 
     @field_validator("trading_style", mode="before")
