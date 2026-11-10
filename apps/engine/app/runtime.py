@@ -148,6 +148,7 @@ class TradingRuntime:
         self._last_copilot_book_review_mono: float = 0.0
         self._copilot_entry_mono: dict[str, float] = {}
         self._last_copilot_by_symbol: dict[str, CopilotDecision] = {}
+        self._copilot_log: list[dict[str, Any]] = []
         if store is None:
             self._restore_persisted_state()
 
@@ -169,6 +170,11 @@ class TradingRuntime:
             history = data.get("signal_history")
             if isinstance(history, list):
                 self.signal_history = [row for row in history if isinstance(row, dict)][-100:]
+            copilot_rows = data.get("copilot_log")
+            if isinstance(copilot_rows, list):
+                self._copilot_log = [row for row in copilot_rows if isinstance(row, dict)][-80:]
+            else:
+                self._rebuild_copilot_log_from_journal()
             self._last_buy_at = parse_last_buys(data.get("last_buy_at"))
             if data.get("killed"):
                 self.killed = True
@@ -188,6 +194,35 @@ class TradingRuntime:
         except Exception as exc:  # noqa: BLE001
             logger.warning("persist restore failed: %s", exc)
 
+    def _rebuild_copilot_log_from_journal(self) -> None:
+        rows: list[dict[str, Any]] = []
+        for entry in self.journal.entries:
+            if str(entry.action) != "copilot":
+                continue
+            note = str(entry.note or "")
+            soft = note == "copilot_soft_fail"
+            action = "approve"
+            if note.startswith("copilot:"):
+                action = note.split(":", 1)[1].strip() or "approve"
+            ts = entry.ts.isoformat() if hasattr(entry.ts, "isoformat") else str(entry.ts)
+            rows.append(
+                {
+                    "ts": ts,
+                    "symbol": entry.symbol,
+                    "kind": "journal",
+                    "side": "",
+                    "price": float(entry.price),
+                    "action": action,
+                    "size_mult": 1.0,
+                    "reason_fr": str(entry.explanation or entry.narrative or ""),
+                    "soft_fail": soft,
+                    "provider": "",
+                    "model": "",
+                    "latency_ms": 0,
+                }
+            )
+        self._copilot_log = rows[-80:]
+
     def _state_payload(self) -> dict[str, Any]:
         return {
             "saved_at": datetime.now(timezone.utc).isoformat(),
@@ -206,6 +241,7 @@ class TradingRuntime:
             },
             "journal": [e.to_dict() for e in self.journal.entries[-200:]],
             "signal_history": self.signal_history[-50:],
+            "copilot_log": self._copilot_log[-80:],
             "last_buy_at": {k: v.isoformat() for k, v in self._last_buy_at.items()},
             "session_started_at": self.equity_history.session_started_at.isoformat(),
             "equity_history": self.equity_history.dump()[-4000:],
@@ -286,6 +322,9 @@ class TradingRuntime:
             return
         self.store.load_runtime(self)
         self._reload_params_only()
+        # API process has no live log — rebuild from journal. Trader keeps the ring buffer.
+        if self.lease is None or not self._copilot_log:
+            self._rebuild_copilot_log_from_journal()
         if self.params.universe_enabled:
             self.universe.size = int(self.params.universe_size)
             self.universe.min_volume_usd = float(self.params.universe_min_volume_usd)
@@ -592,11 +631,68 @@ class TradingRuntime:
                     "confidence": signal.get("confidence"),
                     "order_placed": decision.get("order_placed"),
                     "narrative": text,
+                    "copilot": decision.get("copilot"),
                 }
             )
             if len(rows) >= limit:
                 break
         return rows
+
+    def copilot_feed(self, limit: int = 20) -> list[dict[str, Any]]:
+        """Recent LLM co-pilot judgments for the dashboard."""
+        return list(reversed(self._copilot_log[-limit:]))
+
+    def _record_copilot(
+        self,
+        *,
+        symbol: str,
+        kind: str,
+        side: str,
+        price: float,
+        decision: CopilotDecision,
+        confidence: float = 0.0,
+        journal: bool = True,
+    ) -> None:
+        row = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "symbol": symbol,
+            "kind": kind,
+            "side": side,
+            "price": float(price),
+            "action": decision.action,
+            "size_mult": decision.size_mult,
+            "reason_fr": decision.reason_fr,
+            "soft_fail": decision.soft_fail,
+            "provider": decision.provider,
+            "model": decision.model,
+            "latency_ms": decision.latency_ms,
+        }
+        self._copilot_log.append(row)
+        self._copilot_log = self._copilot_log[-80:]
+        if not journal:
+            return
+        # Always journal so the decision board survives refresh (approve included).
+        note = f"copilot:{decision.action}"
+        if decision.soft_fail:
+            note = "copilot_soft_fail"
+        provider_bit = f" ({decision.provider})" if decision.provider else ""
+        self.journal.add(
+            symbol=symbol,
+            action="copilot",
+            price=float(price),
+            qty=0.0,
+            trade_id=None,
+            confidence=float(confidence),
+            features={},
+            top_features=[],
+            explanation=decision.reason_fr,
+            note=note,
+            narrative=(
+                f"Co-pilote {decision.action}{provider_bit}"
+                + (f" ×{decision.size_mult:.2f}" if decision.action == "resize" else "")
+                + f" — {decision.reason_fr}"
+            ),
+        )
 
     def signal_view(self) -> dict[str, Any]:
         latest = self.last_signal.to_dict() if self.last_signal else None
@@ -609,6 +705,7 @@ class TradingRuntime:
             "explanation": explanation,
             "narrative": decisions[0]["narrative"] if decisions else None,
             "decisions": decisions,
+            "copilot_decisions": self.copilot_feed(),
             "history": list(reversed(self.signal_history[-20:])),
             "last_tick_at": self.last_tick_at.isoformat() if self.last_tick_at else None,
         }
@@ -622,6 +719,7 @@ class TradingRuntime:
             "price": self.last_price,
             "signal": self.signal_view(),
             "decisions": self.decision_feed(),
+            "copilot_decisions": self.copilot_feed(),
             "trades": [annotate_trade_for_display(t) for t in reversed(self.wallet.trades[-30:])],
             "journal": self.journal.list(limit=40, source="live"),
             "news": self.news.brief_dict(),
@@ -1179,20 +1277,14 @@ class TradingRuntime:
         self._copilot_entry_mono[symbol] = time.monotonic()
         decision = self.copilot.review_entry(ctx)
         self._last_copilot_by_symbol[symbol] = decision
-        if decision.soft_fail:
-            self.journal.add(
-                symbol=symbol,
-                action="copilot",
-                price=float(price),
-                qty=0.0,
-                trade_id=None,
-                confidence=float(signal.confidence),
-                features={},
-                top_features=[],
-                explanation=decision.reason_fr,
-                note="copilot_soft_fail",
-                narrative=f"Co-pilote : {decision.reason_fr}",
-            )
+        self._record_copilot(
+            symbol=symbol,
+            kind="entry",
+            side=side,
+            price=price,
+            decision=decision,
+            confidence=float(signal.confidence),
+        )
         return decision
 
     def _copilot_review_book(self) -> list[dict[str, Any]]:
@@ -1225,20 +1317,15 @@ class TradingRuntime:
             )
             decision = self.copilot.review_position(ctx)
             self._last_copilot_by_symbol[sym] = decision
+            self._record_copilot(
+                symbol=sym,
+                kind="position",
+                side="review",
+                price=float(price),
+                decision=decision,
+                confidence=0.0,
+            )
             if decision.soft_fail:
-                self.journal.add(
-                    symbol=sym,
-                    action="copilot",
-                    price=float(price),
-                    qty=0.0,
-                    trade_id=None,
-                    confidence=0.0,
-                    features={},
-                    top_features=[],
-                    explanation=decision.reason_fr,
-                    note="copilot_soft_fail",
-                    narrative=f"Co-pilote : {decision.reason_fr}",
-                )
                 continue
             if decision.action != "force_exit":
                 continue
@@ -1976,6 +2063,8 @@ class TradingRuntime:
         self._rr_index = 0
         self._last_buy_at.clear()
         self._exit_levels.clear()
+        self._copilot_log.clear()
+        self._last_copilot_by_symbol.clear()
         self.journal.clear()
         self.alerts.reset_pnl_tracker()
         self.killed = False

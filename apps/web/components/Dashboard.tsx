@@ -84,6 +84,22 @@ type DecisionLine = {
   action?: string;
   narrative: string;
   reason?: string;
+  copilot?: CopilotDecisionLine | null;
+};
+
+type CopilotDecisionLine = {
+  ts: string;
+  symbol: string;
+  kind?: string;
+  side?: string;
+  price?: number;
+  action: string;
+  size_mult?: number;
+  reason_fr: string;
+  soft_fail?: boolean;
+  provider?: string;
+  model?: string;
+  latency_ms?: number;
 };
 
 type SignalPayload = {
@@ -97,6 +113,7 @@ type SignalPayload = {
   explanation: string | null;
   narrative?: string | null;
   decisions?: DecisionLine[];
+  copilot_decisions?: CopilotDecisionLine[];
   history: Array<{ ts: string; price: number; signal: { action: string; confidence: number } }>;
 };
 
@@ -359,7 +376,14 @@ export function Dashboard() {
             news_hits: data.universe?.news_hits || prev?.news_hits,
           }));
         }
-        if (data.signal) setSignals(data.signal);
+        if (data.signal) {
+          const sig = data.signal;
+          const rootCopilot = (data as { copilot_decisions?: CopilotDecisionLine[] }).copilot_decisions;
+          if (rootCopilot && !sig.copilot_decisions) {
+            sig.copilot_decisions = rootCopilot;
+          }
+          setSignals(sig);
+        }
         if (data.trades) {
           setTrades(data.trades);
           const incoming = data.trades
@@ -935,6 +959,10 @@ export function Dashboard() {
           <DecisionJournal items={signals?.decisions || []} />
         </div>
         <div className="card col-span-2">
+          <p className="label mb-2">Décisions co-pilote IA</p>
+          <CopilotDecisions items={signals?.copilot_decisions || []} compact />
+        </div>
+        <div className="card col-span-2">
           <NewsPanel brief={newsBrief} loading={newsLoading} compact />
         </div>
         <div
@@ -1267,6 +1295,10 @@ export function Dashboard() {
           </p>
           <SignalText text={signals?.explanation} className="mt-2 space-y-1 text-xs leading-relaxed text-slate-300" />
           <DecisionJournal items={signals?.decisions || []} />
+          <div className="mt-4 border-t border-line/60 pt-3">
+            <h3 className="mb-2 text-sm font-medium">Décisions co-pilote IA</h3>
+            <CopilotDecisions items={signals?.copilot_decisions || []} />
+          </div>
           <div className="mt-3 space-y-1 text-xs text-muted">
             {(signals?.history || []).slice(0, 5).map((h) => (
               <div key={h.ts} className="flex justify-between gap-2">
@@ -1526,23 +1558,28 @@ export function Dashboard() {
           <ul className="max-h-80 space-y-3 overflow-auto text-sm">
             {journal.length === 0 && <li className="text-muted">Aucune décision enregistrée</li>}
             {journal.map((j) => {
+              const isCopilot = String(j.action) === "copilot" || String(j.note || "").startsWith("copilot");
               const kind = decisionKind(String(j.action), String(j.narrative || j.explanation || ""));
               return (
                 <li
                   key={String(j.id)}
-                  className={`rounded-lg border border-line border-l-2 p-3 ${decisionBorder(kind)}`}
+                  className={`rounded-lg border border-line border-l-2 p-3 ${
+                    isCopilot ? "border-l-sky-400" : decisionBorder(kind)
+                  }`}
                 >
                   <div className="mb-1 flex flex-wrap items-center justify-between gap-2">
                     <div className="flex flex-wrap items-center gap-2">
-                      <DecisionFlag kind={kind} />
+                      {isCopilot ? <CopilotFlag note={String(j.note || "")} /> : <DecisionFlag kind={kind} />}
                       <span className="font-medium">{String(j.symbol)}</span>
                     </div>
                     <span className="text-muted">{new Date(String(j.ts)).toLocaleString("fr-FR")}</span>
                   </div>
-                  <p>
-                    prix {money(Number(j.price))} · qté {Number(j.qty).toFixed(6)} · confiance{" "}
-                    {(Number(j.confidence) * 100).toFixed(0)}%
-                  </p>
+                  {!isCopilot ? (
+                    <p>
+                      prix {money(Number(j.price))} · qté {Number(j.qty).toFixed(6)} · confiance{" "}
+                      {(Number(j.confidence) * 100).toFixed(0)}%
+                    </p>
+                  ) : null}
                   {j.narrative ? (
                     <p className="mt-1 text-sm leading-relaxed text-slate-200">{String(j.narrative)}</p>
                   ) : (
@@ -1645,6 +1682,7 @@ function DecisionJournal({ items }: { items: DecisionLine[] }) {
         <ul className="max-h-64 space-y-2 overflow-auto text-sm leading-relaxed">
           {items.map((item, index) => {
             const kind = decisionKind(item.action, item.narrative);
+            const copilot = item.copilot;
             return (
               <li
                 key={`${item.ts}-${item.symbol}-${index}`}
@@ -1654,6 +1692,11 @@ function DecisionJournal({ items }: { items: DecisionLine[] }) {
                   <DecisionFlag kind={kind} />
                   <span className="font-medium text-slate-100">{formatDecisionTime(item.ts)}</span>
                   {item.symbol ? <span className="text-xs text-muted">{item.symbol}</span> : null}
+                  {copilot ? (
+                    <span className="rounded bg-sky-500/15 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-sky-300">
+                      Co-pilote {copilotActionLabel(copilot.action)}
+                    </span>
+                  ) : null}
                 </div>
                 <p className="text-slate-300">{item.narrative}</p>
               </li>
@@ -1662,6 +1705,67 @@ function DecisionJournal({ items }: { items: DecisionLine[] }) {
         </ul>
       )}
     </div>
+  );
+}
+
+function copilotActionLabel(action: string): string {
+  const a = (action || "").toLowerCase();
+  if (a === "approve") return "approuve";
+  if (a === "veto") return "veto";
+  if (a === "resize") return "resize";
+  if (a === "force_exit") return "sortie forcée";
+  return a || "—";
+}
+
+function CopilotFlag({ note }: { note?: string }) {
+  const action = note?.startsWith("copilot:") ? note.slice("copilot:".length) : note === "copilot_soft_fail" ? "soft" : "llm";
+  return (
+    <span className="inline-flex items-center gap-1 rounded-full bg-sky-500/20 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-sky-300">
+      <span className="h-2 w-2 rounded-full bg-sky-400" aria-hidden />
+      Co-pilote {copilotActionLabel(action)}
+    </span>
+  );
+}
+
+function CopilotDecisions({
+  items,
+  compact = false,
+}: {
+  items: CopilotDecisionLine[];
+  compact?: boolean;
+}) {
+  if (!items.length) {
+    return (
+      <p className="text-sm text-muted">
+        Aucune décision co-pilote encore. Active le co-pilote et laisse tourner un tick.
+      </p>
+    );
+  }
+  return (
+    <ul className={`${compact ? "max-h-40" : "max-h-72"} space-y-2 overflow-auto text-sm`}>
+      {items.map((item, index) => (
+        <li
+          key={`${item.ts}-${item.symbol}-${item.action}-${index}`}
+          className="rounded-lg border border-line border-l-2 border-l-sky-400 px-3 py-2"
+        >
+          <div className="mb-1 flex flex-wrap items-center gap-2">
+            <CopilotFlag note={`copilot:${item.action}`} />
+            {item.soft_fail ? (
+              <span className="text-[10px] uppercase tracking-wide text-amber-300">soft-fail</span>
+            ) : null}
+            <span className="font-medium text-slate-100">{formatDecisionTime(item.ts)}</span>
+            <span className="text-xs text-muted">{item.symbol}</span>
+            {item.provider ? <span className="text-[10px] text-muted">{item.provider}</span> : null}
+          </div>
+          <p className="leading-relaxed text-slate-300">
+            {item.reason_fr || "—"}
+            {item.action === "resize" && item.size_mult != null
+              ? ` · taille ×${Number(item.size_mult).toFixed(2)}`
+              : ""}
+          </p>
+        </li>
+      ))}
+    </ul>
   );
 }
 
