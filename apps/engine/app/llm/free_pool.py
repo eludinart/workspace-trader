@@ -91,11 +91,12 @@ def pool_mode() -> str:
 def configured_hops() -> list[PoolHop]:
     settings = get_llm_settings() or LlmSettings()
     hops: list[PoolHop] = []
+    # Defaults track current free/dev availability (Aug 2026+: llama-3.1-8b retired → 404).
     groq_model = (
-        _app_or_env(settings.groq_model, "GROQ_MODEL") or "llama-3.1-8b-instant"
+        _app_or_env(settings.groq_model, "GROQ_MODEL") or "openai/gpt-oss-20b"
     )
     gemini_model = (
-        _app_or_env(settings.gemini_model, "GEMINI_MODEL") or "gemini-2.0-flash"
+        _app_or_env(settings.gemini_model, "GEMINI_MODEL") or "gemini-3.1-flash-lite"
     )
     or_model = (
         _app_or_env(settings.openrouter_free_model, "OPENROUTER_FREE_MODEL")

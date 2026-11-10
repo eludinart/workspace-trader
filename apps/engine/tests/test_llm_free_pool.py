@@ -14,8 +14,12 @@ def test_configured_hops_order_groq_then_gemini(monkeypatch) -> None:
     monkeypatch.setenv("GROQ_API_KEY_2", "gsk_test2")
     monkeypatch.setenv("GEMINI_API_KEY", "gem_test")
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("GROQ_MODEL", raising=False)
+    monkeypatch.delenv("GEMINI_MODEL", raising=False)
     hops = free_pool.configured_hops()
     assert [h.id for h in hops] == ["groq-1", "groq-2", "gemini"]
+    assert hops[0].model == "openai/gpt-oss-20b"
+    assert hops[2].model == "gemini-3.1-flash-lite"
     assert free_pool.pool_configured() is True
 
 

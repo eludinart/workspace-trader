@@ -1569,7 +1569,14 @@ export function Dashboard() {
                 >
                   <div className="mb-1 flex flex-wrap items-center justify-between gap-2">
                     <div className="flex flex-wrap items-center gap-2">
-                      {isCopilot ? <CopilotFlag note={String(j.note || "")} /> : <DecisionFlag kind={kind} />}
+                      {isCopilot ? (
+                        <CopilotFlag
+                          note={String(j.note || "")}
+                          softFail={String(j.note || "") === "copilot_soft_fail"}
+                        />
+                      ) : (
+                        <DecisionFlag kind={kind} />
+                      )}
                       <span className="font-medium">{String(j.symbol)}</span>
                     </div>
                     <span className="text-muted">{new Date(String(j.ts)).toLocaleString("fr-FR")}</span>
@@ -1717,12 +1724,18 @@ function copilotActionLabel(action: string): string {
   return a || "—";
 }
 
-function CopilotFlag({ note }: { note?: string }) {
-  const action = note?.startsWith("copilot:") ? note.slice("copilot:".length) : note === "copilot_soft_fail" ? "soft" : "llm";
+function CopilotFlag({ note, softFail }: { note?: string; softFail?: boolean }) {
+  const action = note?.startsWith("copilot:")
+    ? note.slice("copilot:".length)
+    : note === "copilot_soft_fail" || softFail
+      ? "soft"
+      : "llm";
+  const label =
+    softFail || action === "soft" ? "indisponible" : copilotActionLabel(action);
   return (
     <span className="inline-flex items-center gap-1 rounded-full bg-sky-500/20 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-sky-300">
       <span className="h-2 w-2 rounded-full bg-sky-400" aria-hidden />
-      Co-pilote {copilotActionLabel(action)}
+      Co-pilote {label}
     </span>
   );
 }
@@ -1749,7 +1762,7 @@ function CopilotDecisions({
           className="rounded-lg border border-line border-l-2 border-l-sky-400 px-3 py-2"
         >
           <div className="mb-1 flex flex-wrap items-center gap-2">
-            <CopilotFlag note={`copilot:${item.action}`} />
+            <CopilotFlag note={`copilot:${item.action}`} softFail={Boolean(item.soft_fail)} />
             {item.soft_fail ? (
               <span className="text-[10px] uppercase tracking-wide text-amber-300">soft-fail</span>
             ) : null}

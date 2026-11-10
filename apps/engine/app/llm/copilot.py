@@ -178,11 +178,20 @@ class CopilotService:
         ]
         result = free_pool_complete(messages, max_tokens=180, temperature=0.15)
         if not result.ok:
-            logger.warning("copilot soft-fail kind=%s err=%s", kind, result.error)
+            logger.warning(
+                "copilot soft-fail kind=%s err=%s provider=%s model=%s",
+                kind,
+                result.error,
+                result.provider,
+                result.model,
+            )
+            detail = result.error or "erreur"
+            if result.model:
+                detail = f"{detail} · {result.provider or '?'}/{result.model}"
             return CopilotDecision(
                 action="approve",
                 size_mult=1.0,
-                reason_fr=f"Co-pilote indisponible ({result.error or 'erreur'}) — décision modèle seule.",
+                reason_fr=f"Co-pilote indisponible ({detail}) — décision modèle seule.",
                 soft_fail=True,
                 provider=result.provider,
                 model=result.model,
