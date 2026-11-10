@@ -9,7 +9,7 @@ from typing import Any
 
 from psycopg.types.json import Json
 
-from app.config import AlertParams, BotParams
+from app.config import AlertParams, BotParams, LlmSettings
 from app.db import get_conn
 from app.journal import DecisionJournal
 from app.persist import load_state, parse_last_buys
@@ -278,20 +278,32 @@ class Store:
                 conn.rollback()
                 raise
 
-    def save_params(self, params: BotParams, alerts: AlertParams) -> None:
+    def save_params(
+        self,
+        params: BotParams,
+        alerts: AlertParams,
+        llm: LlmSettings | None = None,
+    ) -> None:
+        llm_settings = llm if llm is not None else LlmSettings()
         with get_conn() as conn:
             try:
                 with conn.cursor() as cur:
                     cur.execute(
                         """
-                        INSERT INTO bot_params (id, params, alerts, updated_at)
-                        VALUES (%s, %s, %s, CURRENT_TIMESTAMP)
+                        INSERT INTO bot_params (id, params, alerts, llm, updated_at)
+                        VALUES (%s, %s, %s, %s, CURRENT_TIMESTAMP)
                         ON CONFLICT (id) DO UPDATE SET
                           params = EXCLUDED.params,
                           alerts = EXCLUDED.alerts,
+                          llm = EXCLUDED.llm,
                           updated_at = CURRENT_TIMESTAMP
                         """,
-                        (_SINGLETON_ID, Json(params.model_dump()), Json(alerts.model_dump())),
+                        (
+                            _SINGLETON_ID,
+                            Json(params.model_dump()),
+                            Json(alerts.model_dump()),
+                            Json(llm_settings.model_dump()),
+                        ),
                     )
                 conn.commit()
             except Exception:
@@ -474,17 +486,23 @@ class Store:
                 conn.rollback()
                 raise
 
-    def load_params(self) -> tuple[BotParams, AlertParams]:
+    def load_params(self) -> tuple[BotParams, AlertParams, LlmSettings]:
         with get_conn() as conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT params, alerts FROM bot_params WHERE id = %s", (_SINGLETON_ID,))
+                cur.execute(
+                    "SELECT params, alerts, llm FROM bot_params WHERE id = %s",
+                    (_SINGLETON_ID,),
+                )
                 row = cur.fetchone()
         if not row:
-            return BotParams(), AlertParams()
-        params_raw, alerts_raw = row
+            return BotParams(), AlertParams(), LlmSettings()
+        params_raw = row[0]
+        alerts_raw = row[1]
+        llm_raw = row[2] if len(row) > 2 else {}
         params = BotParams.model_validate(params_raw if isinstance(params_raw, dict) else {})
         alerts = AlertParams.model_validate(alerts_raw if isinstance(alerts_raw, dict) else {})
-        return params, alerts
+        llm = LlmSettings.model_validate(llm_raw if isinstance(llm_raw, dict) else {})
+        return params, alerts, llm
 
     def audit(self, actor: str, action: str, payload: dict[str, Any] | None = None) -> None:
         with get_conn() as conn:

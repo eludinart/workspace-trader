@@ -181,6 +181,9 @@ def test_api_close_queues_until_trader_applies(
     lease = LeaseManager("owner-close")
     assert lease.acquire()
     owner = TradingRuntime(store=store, lease=lease)
+    # Full flat close — not twin L2 partial fills (out of scope for queue test).
+    owner.params.execution_twin_enabled = False
+    owner.params.order_book_depth_enabled = False
     _seed_trade(owner)
     owner.prices["BTC-USD"] = 51_000.0
     owner._persist_state()

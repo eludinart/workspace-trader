@@ -149,10 +149,13 @@ export const api = {
   refreshUniverse: () =>
     engineFetch("/universe/refresh", { method: "POST", body: "{}" }) as Promise<UniversePayload>,
   alertParams: () => engineFetch("/alerts/params"),
+  llmParams: () => engineFetch("/llm/params"),
   putParams: (body: Record<string, unknown>) =>
     engineFetch("/params", { method: "PUT", body: JSON.stringify(body) }),
   putAlerts: (body: Record<string, unknown>) =>
     engineFetch("/alerts/params", { method: "PUT", body: JSON.stringify(body) }),
+  putLlmParams: (body: Record<string, unknown>) =>
+    engineFetch("/llm/params", { method: "PUT", body: JSON.stringify(body) }),
   tick: () => engineFetch("/bot/tick", { method: "POST", body: "{}" }),
   start: () => engineFetch("/bot/start", { method: "POST", body: "{}" }),
   stop: () => engineFetch("/bot/stop", { method: "POST", body: "{}" }),

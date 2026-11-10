@@ -163,10 +163,11 @@ def test_store_params_and_audit(store_db: None) -> None:
     alerts = AlertParams(telegram_enabled=True, telegram_chat_id="123")
 
     store.save_params(params, alerts)
-    loaded_params, loaded_alerts = store.load_params()
+    loaded_params, loaded_alerts, loaded_llm = store.load_params()
     assert loaded_params.initial_balance == 5_000.0
     assert loaded_params.symbol == "ETH-USD"
     assert loaded_alerts.telegram_enabled is True
     assert loaded_alerts.telegram_chat_id == "123"
+    assert loaded_llm.groq_api_key == ""
 
     store.audit("cursor", "set_params", {"field": "symbol"})

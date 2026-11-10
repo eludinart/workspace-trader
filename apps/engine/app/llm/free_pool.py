@@ -4,15 +4,21 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any
 
 import httpx
 
+from app.config import LlmSettings
+
 logger = logging.getLogger(__name__)
 
 _ADVANCE_STATUSES = frozenset({401, 402, 403, 404, 408, 413, 429, 500, 502, 503, 529})
+
+_settings_lock = threading.Lock()
+_settings: LlmSettings | None = None
 
 
 @dataclass(frozen=True)
@@ -36,6 +42,18 @@ class FreePoolResult:
     error: str | None = None
 
 
+def set_llm_settings(settings: LlmSettings | None) -> None:
+    """Install process-local in-app LLM settings (app fields override env)."""
+    global _settings
+    with _settings_lock:
+        _settings = settings
+
+
+def get_llm_settings() -> LlmSettings | None:
+    with _settings_lock:
+        return _settings
+
+
 def _env(*names: str) -> str:
     for name in names:
         val = str(os.getenv(name) or "").strip()
@@ -44,22 +62,54 @@ def _env(*names: str) -> str:
     return ""
 
 
+def _app_or_env(app_value: str, *env_names: str) -> str:
+    text = str(app_value or "").strip()
+    if text:
+        return text
+    return _env(*env_names)
+
+
 def pool_mode() -> str:
+    settings = get_llm_settings()
+    if settings is not None:
+        app_mode = str(settings.free_pool or "").strip().lower()
+        if app_mode in {"on", "off", "auto"}:
+            # Only trust explicit app mode; still allow env when auto + env forces off/on
+            # via LLM_FREE_POOL when app left at default auto and env is set.
+            if app_mode in {"on", "off"}:
+                return app_mode
     raw = str(os.getenv("LLM_FREE_POOL") or "auto").strip().lower()
     if raw in {"1", "true", "on", "yes"}:
         return "on"
     if raw in {"0", "false", "off", "no"}:
         return "off"
+    if settings is not None and str(settings.free_pool or "").strip().lower() == "auto":
+        return "auto"
     return "auto"
 
 
 def configured_hops() -> list[PoolHop]:
+    settings = get_llm_settings() or LlmSettings()
     hops: list[PoolHop] = []
-    groq_model = _env("GROQ_MODEL") or "llama-3.1-8b-instant"
-    gemini_model = _env("GEMINI_MODEL") or "gemini-2.0-flash"
-    or_model = _env("OPENROUTER_FREE_MODEL") or "deepseek/deepseek-chat-v3-0324:free"
+    groq_model = (
+        _app_or_env(settings.groq_model, "GROQ_MODEL") or "llama-3.1-8b-instant"
+    )
+    gemini_model = (
+        _app_or_env(settings.gemini_model, "GEMINI_MODEL") or "gemini-2.0-flash"
+    )
+    or_model = (
+        _app_or_env(settings.openrouter_free_model, "OPENROUTER_FREE_MODEL")
+        or "deepseek/deepseek-chat-v3-0324:free"
+    )
 
-    groq_keys = [k for k in (_env("GROQ_API_KEY"), _env("GROQ_API_KEY_2")) if k]
+    groq_keys = [
+        k
+        for k in (
+            _app_or_env(settings.groq_api_key, "GROQ_API_KEY"),
+            _app_or_env(settings.groq_api_key_2, "GROQ_API_KEY_2"),
+        )
+        if k
+    ]
     for i, key in enumerate(groq_keys):
         hops.append(
             PoolHop(
@@ -71,7 +121,7 @@ def configured_hops() -> list[PoolHop]:
             )
         )
 
-    gemini_key = _env("GEMINI_API_KEY")
+    gemini_key = _app_or_env(settings.gemini_api_key, "GEMINI_API_KEY")
     if gemini_key:
         hops.append(
             PoolHop(
@@ -83,7 +133,7 @@ def configured_hops() -> list[PoolHop]:
             )
         )
 
-    or_key = _env("OPENROUTER_API_KEY")
+    or_key = _app_or_env(settings.openrouter_api_key, "OPENROUTER_API_KEY")
     if or_key:
         hops.append(
             PoolHop(
@@ -105,6 +155,18 @@ def pool_configured() -> bool:
     if mode == "on":
         return True
     return len(hops) > 0
+
+
+def resolve_timeout_ms(explicit: int | None = None) -> int:
+    if explicit is not None:
+        return max(500, int(explicit))
+    settings = get_llm_settings()
+    if settings is not None and int(settings.timeout_ms or 0) > 0:
+        return max(500, int(settings.timeout_ms))
+    try:
+        return max(500, int(os.getenv("LLM_TIMEOUT_MS") or 2500))
+    except ValueError:
+        return 2500
 
 
 def _headers(hop: PoolHop) -> dict[str, str]:
@@ -212,11 +274,7 @@ def complete(
     temperature: float = 0.2,
 ) -> FreePoolResult:
     """Try hops in order; return first ok completion or last failure."""
-    if timeout_ms is None:
-        try:
-            timeout_ms = int(os.getenv("LLM_TIMEOUT_MS") or 2500)
-        except ValueError:
-            timeout_ms = 2500
+    timeout_ms = resolve_timeout_ms(timeout_ms)
     hops = configured_hops()
     if not hops or not pool_configured():
         return FreePoolResult(

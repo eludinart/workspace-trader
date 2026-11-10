@@ -251,6 +251,18 @@ class AlertUpdate(BaseModel):
     strong_signal_threshold: float | None = None
 
 
+class LlmUpdate(BaseModel):
+    groq_api_key: str | None = None
+    groq_api_key_2: str | None = None
+    gemini_api_key: str | None = None
+    openrouter_api_key: str | None = None
+    groq_model: str | None = None
+    gemini_model: str | None = None
+    openrouter_free_model: str | None = None
+    timeout_ms: int | None = Field(default=None, ge=500, le=30_000)
+    free_pool: str | None = None
+
+
 class ResetBody(BaseModel):
     initial_balance: float | None = Field(default=None, gt=0)
 
@@ -278,6 +290,22 @@ def _mask_alerts() -> dict[str, Any]:
         out["telegram_bot_token"] = "***"
     if out.get("smtp_password"):
         out["smtp_password"] = "***"
+    return out
+
+
+_LLM_SECRET_FIELDS = (
+    "groq_api_key",
+    "groq_api_key_2",
+    "gemini_api_key",
+    "openrouter_api_key",
+)
+
+
+def _mask_llm() -> dict[str, Any]:
+    out = runtime.llm.model_dump()
+    for key in _LLM_SECRET_FIELDS:
+        if out.get(key):
+            out[key] = "***"
     return out
 
 
@@ -580,6 +608,21 @@ def put_alert_params(body: AlertUpdate) -> dict[str, Any]:
         patch.pop("smtp_password")
     runtime.update_alerts(patch)
     return _mask_alerts()
+
+
+@app.get("/llm/params")
+def get_llm_params() -> dict[str, Any]:
+    return _mask_llm()
+
+
+@app.put("/llm/params")
+def put_llm_params(body: LlmUpdate) -> dict[str, Any]:
+    patch = body.model_dump(exclude_unset=True)
+    for key in _LLM_SECRET_FIELDS:
+        if patch.get(key) == "***":
+            patch.pop(key)
+    runtime.update_llm(patch)
+    return _mask_llm()
 
 
 @app.get("/alerts/history")

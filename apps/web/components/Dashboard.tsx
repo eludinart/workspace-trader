@@ -108,6 +108,7 @@ export function Dashboard() {
   const [journal, setJournal] = useState<Array<Record<string, unknown>>>([]);
   const [params, setParams] = useState<Record<string, unknown>>({});
   const [alerts, setAlerts] = useState<Record<string, unknown>>({});
+  const [llm, setLlm] = useState<Record<string, unknown>>({});
   const [backtest, setBacktest] = useState<Record<string, unknown> | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -184,12 +185,14 @@ export function Dashboard() {
 
   const refresh = useCallback(async () => {
     try {
-      const [{ acc, pr }, al, lastBt] = await Promise.all([
+      const [{ acc, pr }, al, llmParams, lastBt] = await Promise.all([
         refreshCore(),
         api.alertParams(),
+        api.llmParams().catch(() => ({})),
         api.lastBacktest().catch(() => null),
       ]);
       setAlerts(al);
+      setLlm(llmParams);
       if (lastBt && lastBt.ok) setBacktest(lastBt);
       if (Object.prototype.hasOwnProperty.call(pr, "candle_granularity_sec")) {
         setCandleGranularitySec(normalizeChartTimeframeSec(pr.candle_granularity_sec));
@@ -705,6 +708,33 @@ export function Dashboard() {
     await run("save-alerts", () => api.putAlerts(body), {
       successMessage: "Alertes enregistrées.",
     });
+  }
+
+  async function saveLlm(e: FormEvent<HTMLFormElement>) {
+    e.preventDefault();
+    const fd = new FormData(e.currentTarget);
+    const body: Record<string, unknown> = {
+      groq_api_key: String(fd.get("groq_api_key") || ""),
+      groq_api_key_2: String(fd.get("groq_api_key_2") || ""),
+      gemini_api_key: String(fd.get("gemini_api_key") || ""),
+      openrouter_api_key: String(fd.get("openrouter_api_key") || ""),
+      groq_model: String(fd.get("groq_model") || ""),
+      gemini_model: String(fd.get("gemini_model") || ""),
+      openrouter_free_model: String(fd.get("openrouter_free_model") || ""),
+      timeout_ms: Number(fd.get("timeout_ms") || 2500),
+      free_pool: String(fd.get("free_pool") || "auto"),
+    };
+    const enableCopilot = fd.get("copilot_enabled") === "on";
+    await run(
+      "save-llm",
+      async () => {
+        const saved = await api.putLlmParams(body);
+        setLlm(saved);
+        const nextParams = await api.putParams({ copilot_enabled: enableCopilot });
+        setParams(nextParams);
+      },
+      { successMessage: "Co-pilote LLM enregistré." },
+    );
   }
 
   async function runBacktest(e: FormEvent) {
@@ -1435,6 +1465,39 @@ export function Dashboard() {
             <label className="col-span-2 flex items-center gap-2 text-sm"><input type="checkbox" name="alert_on_strong_signal" defaultChecked={alerts.alert_on_strong_signal !== false} /> Sur signal fort</label>
             <button className="btn-primary col-span-2" disabled={busy} type="submit">Enregistrer alertes</button>
           </form>
+          </div>
+          <div>
+            <h2 className="mb-3 text-lg font-medium">Co-pilote LLM</h2>
+            <p className="mb-2 text-xs text-muted">
+              Clés saisies ici priment sur Coolify. Les champs secrets affichent *** s&apos;ils sont déjà enregistrés — laisser *** pour ne pas les écraser.
+              {systemStatus?.features?.find((f) => f.id === "copilot")
+                ? ` Statut : ${String(systemStatus.features.find((f) => f.id === "copilot")?.detail || "")}`
+                : ""}
+            </p>
+            <form className="grid grid-cols-2 gap-3" onSubmit={(e) => void saveLlm(e)} key={`llm-${String(llm.groq_api_key || "")}-${String(params.copilot_enabled)}`}>
+              <label className="col-span-2 flex items-center gap-2 text-sm">
+                <input type="checkbox" name="copilot_enabled" defaultChecked={params.copilot_enabled === true} /> Activer le co-pilote
+              </label>
+              <Field name="groq_api_key" label="Groq API key" type="password" defaultValue={String(llm.groq_api_key || "")} />
+              <Field name="groq_api_key_2" label="Groq API key 2" type="password" defaultValue={String(llm.groq_api_key_2 || "")} />
+              <Field name="gemini_api_key" label="Gemini API key" type="password" defaultValue={String(llm.gemini_api_key || "")} />
+              <Field name="openrouter_api_key" label="OpenRouter API key" type="password" defaultValue={String(llm.openrouter_api_key || "")} />
+              <Field name="groq_model" label="Modèle Groq" defaultValue={String(llm.groq_model || "")} />
+              <Field name="gemini_model" label="Modèle Gemini" defaultValue={String(llm.gemini_model || "")} />
+              <Field name="openrouter_free_model" label="Modèle OpenRouter :free" defaultValue={String(llm.openrouter_free_model || "")} />
+              <Field name="timeout_ms" label="Timeout ms" type="number" defaultValue={String(llm.timeout_ms ?? 2500)} />
+              <div>
+                <label className="label" htmlFor="free_pool">Pool libre</label>
+                <select className="field" id="free_pool" name="free_pool" defaultValue={String(llm.free_pool || "auto")}>
+                  <option value="auto">auto</option>
+                  <option value="on">on</option>
+                  <option value="off">off</option>
+                </select>
+              </div>
+              <button className="btn-primary col-span-2" disabled={busy} type="submit">
+                Enregistrer co-pilote LLM
+              </button>
+            </form>
           </div>
         </section>
 

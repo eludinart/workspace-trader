@@ -106,7 +106,7 @@ def test_put_params_validates_persists_and_audits(client: TestClient) -> None:
     assert fetched.status_code == 200
     assert fetched.json()["buy_threshold"] == pytest.approx(0.66)
 
-    stored, _alerts = Store().load_params()
+    stored, _alerts, _llm = Store().load_params()
     assert stored.buy_threshold == pytest.approx(0.66)
 
     rows = _audit_rows()

@@ -89,6 +89,7 @@ export const ACTION_LABELS: Record<string, string> = {
   close: "Vente manuelle",
   "save-params": "Enregistrement params",
   "save-alerts": "Enregistrement alertes",
+  "save-llm": "Enregistrement co-pilote LLM",
   "refresh-universe": "Rafraîchissement univers",
   backtest: "Backtest",
 };

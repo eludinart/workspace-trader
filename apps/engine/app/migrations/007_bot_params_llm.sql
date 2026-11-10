@@ -1,0 +1,2 @@
+ALTER TABLE bot_params
+  ADD COLUMN IF NOT EXISTS llm JSONB NOT NULL DEFAULT '{}'::jsonb;

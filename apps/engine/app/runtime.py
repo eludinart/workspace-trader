@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
 from app.alerts import AlertService
-from app.config import AlertParams, BotParams
+from app.config import AlertParams, BotParams, LlmSettings
 from app.events import EventBus
 from app.lease import read_lease
 from app.execution import OrderPlan, buy_spend, cooldown_active, plan_protective, plan_signal
@@ -16,6 +16,7 @@ from app.fidelity import FillSample, FidelityTracker
 from app.fill_model import impact_bps_for_notional, quote_fill, walk_book_fill, walk_real_book
 from app.journal import DecisionJournal
 from app.llm.copilot import CopilotDecision, CopilotService
+from app.llm.free_pool import set_llm_settings
 from app.market.coinbase import CoinbaseClient
 from app.narrative import decision_narrative, format_other_exits, thresholds_from_detail
 from app.news.service import NewsService
@@ -142,6 +143,8 @@ class TradingRuntime:
         self.equity_history = EquityHistory()
         self._last_equity_persist_mono: float = 0.0
         self.copilot = CopilotService()
+        self.llm = LlmSettings()
+        set_llm_settings(self.llm)
         self._last_copilot_book_review_mono: float = 0.0
         self._copilot_entry_mono: dict[str, float] = {}
         self._last_copilot_by_symbol: dict[str, CopilotDecision] = {}
@@ -233,8 +236,11 @@ class TradingRuntime:
     def _save_params(self) -> None:
         if self.store is None:
             return
-        self.store.save_params(self.params, self.alerts.params)
+        self.store.save_params(self.params, self.alerts.params, self.llm)
         self._db_ok = True
+
+    def _sync_llm_settings(self) -> None:
+        set_llm_settings(self.llm)
 
     def _apply_env_signal_flags(self, params: BotParams) -> BotParams:
         """Overlay Coolify SIGNAL_* / WEB_PUSH_ENABLED / COPILOT_* when explicitly set."""
@@ -267,9 +273,11 @@ class TradingRuntime:
     def _reload_params_only(self) -> None:
         if self.store is None:
             return
-        params, alerts = self.store.load_params()
+        params, alerts, llm = self.store.load_params()
         self.params = self._apply_env_signal_flags(params)
         self.alerts.params = alerts
+        self.llm = llm
+        self._sync_llm_settings()
         self._db_ok = True
 
     def _reload_between_ticks(self) -> None:
@@ -1848,6 +1856,18 @@ class TradingRuntime:
         updated = self.alerts.update_params(patch)
         self._save_params()
         return updated
+
+    def update_llm(self, patch: dict[str, Any]) -> LlmSettings:
+        if self.lease is None:
+            self._reload_params_only()
+        data = self.llm.model_dump()
+        clean = {k: v for k, v in patch.items() if v is not None}
+        allowed = set(LlmSettings.model_fields)
+        data.update({k: v for k, v in clean.items() if k in allowed})
+        self.llm = LlmSettings(**data)
+        self._sync_llm_settings()
+        self._save_params()
+        return self.llm
 
     def _apply_pending_reset(self) -> None:
         """Apply an API reset flag. Only the live lease owner writes the book."""

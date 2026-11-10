@@ -9,6 +9,7 @@ from app.llm import free_pool
 
 
 def test_configured_hops_order_groq_then_gemini(monkeypatch) -> None:
+    free_pool.set_llm_settings(None)
     monkeypatch.setenv("GROQ_API_KEY", "gsk_test")
     monkeypatch.setenv("GROQ_API_KEY_2", "gsk_test2")
     monkeypatch.setenv("GEMINI_API_KEY", "gem_test")
@@ -19,6 +20,7 @@ def test_configured_hops_order_groq_then_gemini(monkeypatch) -> None:
 
 
 def test_complete_advances_on_429(monkeypatch) -> None:
+    free_pool.set_llm_settings(None)
     monkeypatch.setenv("GROQ_API_KEY", "gsk_a")
     monkeypatch.setenv("GEMINI_API_KEY", "gem_b")
     monkeypatch.delenv("GROQ_API_KEY_2", raising=False)

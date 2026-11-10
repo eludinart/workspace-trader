@@ -104,6 +104,7 @@ CREATE TABLE IF NOT EXISTS bot_params (
   id INTEGER PRIMARY KEY CHECK (id = 1),
   params TEXT NOT NULL DEFAULT '{}',
   alerts TEXT NOT NULL DEFAULT '{}',
+  llm TEXT NOT NULL DEFAULT '{}',
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 INSERT OR IGNORE INTO bot_params (id) VALUES (1);
@@ -193,7 +194,15 @@ class _SqliteCursor:
                 for idx, col in enumerate(cur.description):
                     val = row[idx]
                     col_name = col[0]
-                    is_json = col_name in {"exit_meta", "payload", "params", "alerts", "last_buy_at", "signal_history"}
+                    is_json = col_name in {
+                        "exit_meta",
+                        "payload",
+                        "params",
+                        "alerts",
+                        "llm",
+                        "last_buy_at",
+                        "signal_history",
+                    }
                     if col_name == "killed":
                         val = bool(val)
                     items.append(_decode_row_value(val, json_columns=is_json))

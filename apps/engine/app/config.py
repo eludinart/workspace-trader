@@ -71,6 +71,30 @@ class AlertParams(BaseModel):
     strong_signal_threshold: float = Field(default=0.75, ge=0.5, le=1.0)
 
 
+class LlmSettings(BaseModel):
+    """In-app LLM free-pool keys/models. Non-empty fields override Coolify env."""
+
+    groq_api_key: str = ""
+    groq_api_key_2: str = ""
+    gemini_api_key: str = ""
+    openrouter_api_key: str = ""
+    groq_model: str = ""
+    gemini_model: str = ""
+    openrouter_free_model: str = ""
+    timeout_ms: int = Field(default=2500, ge=500, le=30_000)
+    free_pool: str = "auto"  # auto | on | off
+
+    @field_validator("free_pool", mode="before")
+    @classmethod
+    def _clean_free_pool(cls, value: Any) -> str:
+        raw = str(value or "auto").strip().lower()
+        if raw in {"1", "true", "yes", "on"}:
+            return "on"
+        if raw in {"0", "false", "no", "off"}:
+            return "off"
+        return "auto"
+
+
 class BotParams(BaseModel):
     """Configurable bot and model parameters."""
 
