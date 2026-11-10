@@ -1724,14 +1724,25 @@ function copilotActionLabel(action: string): string {
   return a || "—";
 }
 
-function CopilotFlag({ note, softFail }: { note?: string; softFail?: boolean }) {
+function CopilotFlag({
+  note,
+  softFail,
+  reason,
+}: {
+  note?: string;
+  softFail?: boolean;
+  reason?: string;
+}) {
+  const soft =
+    Boolean(softFail) ||
+    note === "copilot_soft_fail" ||
+    /indisponible|soft-fail|empty_content|http_\d+/i.test(reason || "");
   const action = note?.startsWith("copilot:")
     ? note.slice("copilot:".length)
-    : note === "copilot_soft_fail" || softFail
+    : soft
       ? "soft"
       : "llm";
-  const label =
-    softFail || action === "soft" ? "indisponible" : copilotActionLabel(action);
+  const label = soft ? "indisponible" : copilotActionLabel(action);
   return (
     <span className="inline-flex items-center gap-1 rounded-full bg-sky-500/20 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-sky-300">
       <span className="h-2 w-2 rounded-full bg-sky-400" aria-hidden />
@@ -1762,7 +1773,11 @@ function CopilotDecisions({
           className="rounded-lg border border-line border-l-2 border-l-sky-400 px-3 py-2"
         >
           <div className="mb-1 flex flex-wrap items-center gap-2">
-            <CopilotFlag note={`copilot:${item.action}`} softFail={Boolean(item.soft_fail)} />
+            <CopilotFlag
+              note={`copilot:${item.action}`}
+              softFail={Boolean(item.soft_fail)}
+              reason={item.reason_fr}
+            />
             {item.soft_fail ? (
               <span className="text-[10px] uppercase tracking-wide text-amber-300">soft-fail</span>
             ) : null}

@@ -65,3 +65,37 @@ def test_complete_advances_on_429(monkeypatch) -> None:
     assert result.ok is True
     assert result.provider == "gemini"
     assert len(calls) == 2
+
+
+def test_gpt_oss_request_gets_reasoning_budget() -> None:
+    hop = free_pool.PoolHop(
+        id="groq-1",
+        provider="groq",
+        base_url="https://api.groq.com/openai/v1",
+        api_key="gsk",
+        model="openai/gpt-oss-120b",
+        max_tokens=512,
+    )
+    body = free_pool._request_body(
+        hop,
+        [{"role": "user", "content": "hi"}],
+        max_tokens=180,
+        temperature=0.15,
+    )
+    assert body["reasoning_effort"] == "low"
+    assert body["max_tokens"] >= 768
+
+
+def test_extract_text_handles_null_content() -> None:
+    assert (
+        free_pool._extract_text(
+            {"choices": [{"message": {"content": None}, "finish_reason": "length"}]}
+        )
+        == ""
+    )
+    assert (
+        free_pool._extract_text(
+            {"choices": [{"message": {"content": '{"action":"veto"}'}}]}
+        )
+        == '{"action":"veto"}'
+    )

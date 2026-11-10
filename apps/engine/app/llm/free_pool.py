@@ -181,6 +181,36 @@ def _headers(hop: PoolHop) -> dict[str, str]:
     return headers
 
 
+def _is_reasoning_model(model: str) -> bool:
+    """Groq gpt-oss / Qwen3 burn completion tokens on hidden reasoning."""
+    m = (model or "").strip().lower()
+    return "gpt-oss" in m or m.startswith("qwen/qwen3")
+
+
+def _request_body(
+    hop: PoolHop,
+    messages: list[dict[str, str]],
+    *,
+    max_tokens: int,
+    temperature: float,
+) -> dict[str, Any]:
+    """Build chat/completions body; gpt-oss needs low effort + room for answer."""
+    effective = max(1, int(max_tokens))
+    hop_cap = max(1, int(hop.max_tokens))
+    body: dict[str, Any] = {
+        "model": hop.model,
+        "messages": messages,
+        "temperature": temperature,
+    }
+    if hop.provider == "groq" and _is_reasoning_model(hop.model):
+        # Hidden reasoning consumes the same max_tokens budget; 180 → empty content.
+        effective = max(effective, 768)
+        hop_cap = max(hop_cap, 2048)
+        body["reasoning_effort"] = "low"
+    body["max_tokens"] = min(effective, hop_cap)
+    return body
+
+
 def _extract_text(payload: dict[str, Any]) -> str:
     choices = payload.get("choices")
     if not isinstance(choices, list) or not choices:
@@ -189,8 +219,20 @@ def _extract_text(payload: dict[str, Any]) -> str:
     if not isinstance(msg, dict):
         return ""
     content = msg.get("content")
-    if isinstance(content, str):
+    if isinstance(content, str) and content.strip():
         return content.strip()
+    # Some OpenAI-compatible payloads return content as a list of parts.
+    if isinstance(content, list):
+        bits: list[str] = []
+        for part in content:
+            if isinstance(part, str) and part.strip():
+                bits.append(part.strip())
+            elif isinstance(part, dict):
+                text = part.get("text") or part.get("content")
+                if isinstance(text, str) and text.strip():
+                    bits.append(text.strip())
+        if bits:
+            return "\n".join(bits)
     return ""
 
 
@@ -203,12 +245,12 @@ def _post_hop(
     temperature: float,
 ) -> FreePoolResult:
     started = time.perf_counter()
-    body = {
-        "model": hop.model,
-        "messages": messages,
-        "temperature": temperature,
-        "max_tokens": min(max_tokens, hop.max_tokens),
-    }
+    body = _request_body(
+        hop,
+        messages,
+        max_tokens=max_tokens,
+        temperature=temperature,
+    )
     url = f"{hop.base_url.rstrip('/')}/chat/completions"
     try:
         with httpx.Client(timeout=max(0.5, timeout_ms / 1000.0)) as client:
@@ -237,6 +279,16 @@ def _post_hop(
         data = res.json()
         text = _extract_text(data if isinstance(data, dict) else {})
         if not text:
+            finish = ""
+            try:
+                ch0 = (data.get("choices") or [None])[0] if isinstance(data, dict) else None
+                if isinstance(ch0, dict):
+                    finish = str(ch0.get("finish_reason") or "")
+            except Exception:  # noqa: BLE001
+                finish = ""
+            err = "empty_content"
+            if finish:
+                err = f"empty_content:{finish}"
             return FreePoolResult(
                 text="",
                 provider=hop.provider,
@@ -244,7 +296,7 @@ def _post_hop(
                 latency_ms=latency,
                 hop_id=hop.id,
                 ok=False,
-                error="empty_content",
+                error=err,
             )
         return FreePoolResult(
             text=text,
