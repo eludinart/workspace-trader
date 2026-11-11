@@ -22,7 +22,12 @@ CopilotAction = Literal["approve", "veto", "resize", "force_exit"]
 
 _SYSTEM = """Tu es le co-pilote paper-trading d'un bot crypto.
 XGBoost a déjà proposé une action. Tu peux: approve, veto, resize (size_mult 0.25–1.0), force_exit (positions ouvertes seulement).
-Règles: ne jamais augmenter le risque au-delà de la proposition; préférer veto si l'edge estimé < friction A/R (~200 bps intro); répondre UNIQUEMENT en JSON compact:
+Règles:
+- ne jamais augmenter le risque au-delà de la proposition;
+- si confiance modèle ≥ 0.55 et pas de news très adverse: préférer approve, ou resize 0.5–0.75 plutôt que veto;
+- veto seulement si edge clairement < ~½ friction A/R (~95 bps) OU news clairement adverse OU book illiquide;
+- paper: laisser passer des setups moyens pour apprendre (évite le veto systématique);
+répondre UNIQUEMENT en JSON compact:
 {"action":"approve|veto|resize|force_exit","size_mult":1.0,"reason_fr":"…"}
 reason_fr en français, max 200 caractères."""
 

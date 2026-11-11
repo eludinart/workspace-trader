@@ -32,7 +32,8 @@ STYLE_PRESETS: dict[TradingStyle, dict[str, Any]] = {
         "label_path_aware": True,
     },
     "intermediaire": {
-        "buy_threshold": 0.62,
+        # Slightly lower so paper can open more often under intro-taker friction.
+        "buy_threshold": 0.58,
         "sell_threshold": 0.50,
         "take_profit_pct": 0.045,
         "stop_loss_pct": 0.022,

@@ -322,6 +322,13 @@ class TradingRuntime:
             return
         self.store.load_runtime(self)
         self._reload_params_only()
+        # API process has no live tick clock — recover from trader-persisted history.
+        if self.last_tick_at is None:
+            tick_at, tick_sym = self._effective_last_tick()
+            if tick_at is not None:
+                self.last_tick_at = tick_at
+            if tick_sym and not self.last_signal_symbol:
+                self.last_signal_symbol = tick_sym
         # API process has no live log — rebuild from journal. Trader keeps the ring buffer.
         if self.lease is None or not self._copilot_log:
             self._rebuild_copilot_log_from_journal()
@@ -2146,6 +2153,26 @@ class TradingRuntime:
             self._db_ok = False
             return False
 
+    def _effective_last_tick(self) -> tuple[datetime | None, str | None]:
+        """Resolve last tick for the API process (in-memory or signal_history from trader)."""
+        if self.last_tick_at is not None:
+            return self.last_tick_at, self.last_signal_symbol
+        for entry in reversed(self.signal_history):
+            if not isinstance(entry, dict):
+                continue
+            raw = entry.get("ts")
+            if not raw:
+                continue
+            try:
+                ts = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            sym = entry.get("symbol")
+            return ts, str(sym) if sym else self.last_signal_symbol
+        return None, self.last_signal_symbol
+
     def status(self) -> dict[str, Any]:
         bot_running = self._bot_running_for_ui()
         return {
@@ -2297,11 +2324,13 @@ class TradingRuntime:
                 "OFF — fills legacy slip (paper trop rose vs live)",
             )
 
-        if self.last_tick_at is None:
+        tick_at, tick_symbol = self._effective_last_tick()
+        if tick_at is None:
             add("last_tick", "Dernière décision", "warn", "Aucun tick encore")
         else:
-            age = max(0.0, (now - self.last_tick_at).total_seconds())
+            age = max(0.0, (now - tick_at).total_seconds())
             limit = max(90.0, float(self.params.decision_interval_sec) * 3)
+            loop_alive = self.running or self._bot_running_for_ui()
             if self.last_error:
                 add(
                     "last_tick",
@@ -2309,7 +2338,7 @@ class TradingRuntime:
                     "error",
                     f"Il y a {int(age)}s — erreur: {self.last_error}",
                 )
-            elif age > limit and self.running:
+            elif age > limit and loop_alive:
                 add(
                     "last_tick",
                     "Dernière décision",
@@ -2321,7 +2350,7 @@ class TradingRuntime:
                     "last_tick",
                     "Dernière décision",
                     "ok",
-                    f"Il y a {int(age)}s · {self.last_signal_symbol or self.params.symbol}",
+                    f"Il y a {int(age)}s · {tick_symbol or self.params.symbol}",
                 )
 
         open_n = len(self.wallet.positions)
