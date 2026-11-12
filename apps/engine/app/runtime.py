@@ -1989,8 +1989,17 @@ class TradingRuntime:
         balance_changed = new_params.initial_balance != self.params.initial_balance
         self.params = new_params
         if self.params.universe_enabled:
+            size_changed = int(self.universe.size) != int(self.params.universe_size)
+            vol_changed = abs(
+                float(self.universe.min_volume_usd) - float(self.params.universe_min_volume_usd)
+            ) >= 1.0
             self.universe.size = int(self.params.universe_size)
             self.universe.min_volume_usd = float(self.params.universe_min_volume_usd)
+            if size_changed or vol_changed:
+                try:
+                    self._ensure_universe(force=True)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("universe refresh after params: %s", exc)
         if balance_changed and not self.wallet.trades and not self.wallet.positions:
             self.wallet.reset(new_params.initial_balance)
             self.peak_equity = new_params.initial_balance

@@ -591,6 +591,8 @@ def get_universe() -> dict[str, Any]:
 @app.post("/universe/refresh")
 def refresh_universe() -> dict[str, Any]:
     runtime._ensure_universe(force=True)
+    # Persist the rebuilt book so hydrate does not revive a stale meme watchlist.
+    runtime._save_params()
     return runtime.universe_view()
 
 
