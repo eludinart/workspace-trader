@@ -40,6 +40,14 @@ class _FakeMarket:
                 "quote_currency": "USD",
                 "quote_increment": "0.00000001",
             },
+            {
+                "id": "PEPE-USD",
+                "status": "online",
+                "trading_disabled": False,
+                "base_currency": "PEPE",
+                "quote_currency": "USD",
+                "quote_increment": "0.00000001",
+            },
         ]
 
     def get_volume_summary(self):
@@ -48,6 +56,7 @@ class _FakeMarket:
             {"id": "MOG-USD", "spot_volume_24hour": 80_000_000},  # volume ok, tick toxic
             {"id": "LINK-USD", "spot_volume_24hour": 40_000_000},
             {"id": "NOICE-USD", "spot_volume_24hour": 25_000_000},  # deny base
+            {"id": "PEPE-USD", "spot_volume_24hour": 200_000_000},  # deny meme
         ]
 
 
@@ -69,6 +78,7 @@ def test_universe_excludes_deny_and_coarse_tick() -> None:
     assert "LINK-USD" in symbols
     assert "MOG-USD" not in symbols
     assert "NOICE-USD" not in symbols
+    assert "PEPE-USD" not in symbols
     assert uni.quote_increments.get("BTC-USD") == 0.01
 
 

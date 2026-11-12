@@ -322,13 +322,13 @@ class TradingRuntime:
             return
         self.store.load_runtime(self)
         self._reload_params_only()
-        # API process has no live tick clock — recover from trader-persisted history.
-        if self.last_tick_at is None:
-            tick_at, tick_sym = self._effective_last_tick()
-            if tick_at is not None:
-                self.last_tick_at = tick_at
-            if tick_sym and not self.last_signal_symbol:
-                self.last_signal_symbol = tick_sym
+        # API process has no live tick clock — always prefer the freshest of memory
+        # vs trader-persisted signal_history (stale last_tick_at used to stick forever).
+        tick_at, tick_sym = self._effective_last_tick()
+        if tick_at is not None:
+            self.last_tick_at = tick_at
+        if tick_sym:
+            self.last_signal_symbol = tick_sym
         # API process has no live log — rebuild from journal. Trader keeps the ring buffer.
         if self.lease is None or not self._copilot_log:
             self._rebuild_copilot_log_from_journal()
@@ -767,6 +767,10 @@ class TradingRuntime:
     def resume_from_kill(self) -> dict[str, Any]:
         self.killed = False
         self.kill_reason = None
+        # Kill switch forces auto_trade=False; resume must restore trading or the
+        # bot stays permanently parked after a max-loss halt.
+        self.params.auto_trade = True
+        self._save_params()
         if self.store is not None:
             if not self.store.set_kill(False, None):
                 self._persist_state()
@@ -1143,6 +1147,48 @@ class TradingRuntime:
     def _equity(self) -> float:
         return float(self.wallet.equity(self.prices_map()))
 
+    def _dust_notional_cap(self) -> float:
+        """Below twin min fill, L2 walk always rejects — treat as write-off dust."""
+        return float(getattr(self.params, "twin_min_fill_notional", 15.0) or 15.0)
+
+    def _write_off_dust(
+        self, symbol: str, qty: float, mark: float, note: str
+    ) -> Trade | None:
+        """Force-close sub-min-notional leftovers the twin cannot fill."""
+        self._require_fill_authority()
+        pos = self.wallet.get_position(symbol)
+        if pos is None or qty <= 0 or mark <= 0:
+            return None
+        qty = min(qty, pos.qty)
+        if pos.qty - qty < 1e-8:
+            qty = pos.qty
+        try:
+            trade = self.wallet.sell(
+                symbol,
+                qty=qty,
+                price=float(mark),
+                fee_bps=0.0,
+                note=f"{note}|dust" if note else "exit:dust",
+                decision_ts=datetime.now(timezone.utc),
+                decision_price=float(mark),
+                latency_ms=0,
+                slip_bps=0.0,
+                impact_bps=0.0,
+            )
+        except ValueError:
+            logger.warning("dust write-off failed %s", symbol)
+            return None
+        if self.wallet.get_position(symbol) is None:
+            self._exit_levels.pop(symbol, None)
+        logger.info(
+            "dust write-off %s qty=%.12g notional=%.4f",
+            symbol,
+            qty,
+            qty * mark,
+        )
+        self._maybe_post_trade_review(trade)
+        return trade
+
     def _sell_qty(self, symbol: str, qty: float, price: float, note: str) -> Trade | None:
         self._require_fill_authority()
         pos = self.wallet.get_position(symbol)
@@ -1152,8 +1198,16 @@ class TradingRuntime:
         if pos.qty - qty < 1e-8:
             qty = pos.qty
         mark = self._side_mark(symbol, "sell", price)
-        q = self._build_fill_quote("sell", mark, notional=qty * mark, symbol=symbol)
+        notional = float(qty) * float(mark)
+        dust_cap = self._dust_notional_cap()
+        # Twin min_fill rejects dust (~$0.01 BTC leftover) and blocks kill flatten.
+        if notional > 0 and notional < dust_cap:
+            return self._write_off_dust(symbol, qty, mark, note)
+        q = self._build_fill_quote("sell", mark, notional=notional, symbol=symbol)
         if getattr(q, "rejected", False) or q.fill_price <= 0:
+            # Rejected full-size sell that somehow shrank under the floor → write off.
+            if notional < dust_cap * 1.01:
+                return self._write_off_dust(symbol, qty, mark, note)
             logger.info("sell rejected %s: %s", symbol, getattr(q, "reject_reason", "empty"))
             return None
         if getattr(q, "filled_notional", 0) and q.fill_price > 0:
@@ -2154,9 +2208,12 @@ class TradingRuntime:
             return False
 
     def _effective_last_tick(self) -> tuple[datetime | None, str | None]:
-        """Resolve last tick for the API process (in-memory or signal_history from trader)."""
-        if self.last_tick_at is not None:
-            return self.last_tick_at, self.last_signal_symbol
+        """Resolve last tick: newer of in-memory clock vs trader signal_history."""
+        mem_ts = self.last_tick_at
+        if mem_ts is not None and mem_ts.tzinfo is None:
+            mem_ts = mem_ts.replace(tzinfo=timezone.utc)
+        hist_ts: datetime | None = None
+        hist_sym: str | None = None
         for entry in reversed(self.signal_history):
             if not isinstance(entry, dict):
                 continue
@@ -2169,9 +2226,15 @@ class TradingRuntime:
                 continue
             if ts.tzinfo is None:
                 ts = ts.replace(tzinfo=timezone.utc)
+            hist_ts = ts
             sym = entry.get("symbol")
-            return ts, str(sym) if sym else self.last_signal_symbol
-        return None, self.last_signal_symbol
+            hist_sym = str(sym) if sym else None
+            break
+        if hist_ts is None:
+            return mem_ts, self.last_signal_symbol
+        if mem_ts is None or hist_ts >= mem_ts:
+            return hist_ts, hist_sym or self.last_signal_symbol
+        return mem_ts, self.last_signal_symbol
 
     def status(self) -> dict[str, Any]:
         bot_running = self._bot_running_for_ui()

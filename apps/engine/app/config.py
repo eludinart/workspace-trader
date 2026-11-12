@@ -165,7 +165,7 @@ class BotParams(BaseModel):
     max_portfolio_risk_r: float = Field(default=5.0, ge=1.0, le=30.0)
     universe_enabled: bool = True
     universe_size: int = Field(default=30, ge=10, le=80)
-    universe_min_volume_usd: float = Field(default=15_000_000.0, ge=0)
+    universe_min_volume_usd: float = Field(default=50_000_000.0, ge=0)
     universe_refresh_hours: float = Field(default=6.0, ge=1.0, le=48.0)
     aggressive_sell_confidence: float = Field(default=0.70, ge=0.5, le=1.0)
     # XGB label window: horizon bars × move threshold (aligned with TP regime).

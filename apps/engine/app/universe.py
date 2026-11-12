@@ -30,7 +30,7 @@ _STABLE_BASES = {
 }
 _SKIP_BASES = {"WBTC", "CBETH", "WETH", "STETH", "TBTC", "CBBTC"}
 
-# Hyper-penny / coarse-tick memes that repeatedly bleed paper via slip ≫ SL.
+# Hyper-penny / coarse-tick / meme tails that repeatedly bleed paper via slip ≫ SL.
 _DENY_BASES = {
     "MOG",
     "NOICE",
@@ -40,6 +40,36 @@ _DENY_BASES = {
     "SPELL",
     "DEGEN",
     "TOSHI",
+    "PEPE",
+    "BONK",
+    "SHIB",
+    "FLOKI",
+    "PUMP",
+    "DOGINME",
+    "GIGA",
+    "TURBO",
+    "PENGU",
+    "SWELL",
+    "VARA",
+    "BLUECHIP",
+    "MEZO",
+    "MON",
+    "B3",
+    "A8",
+    "KAT",
+    "ACS",
+    "XCN",
+    "VTHO",
+    "AMP",
+    "WIF",
+    "POPCAT",
+    "BRETT",
+    "NEIRO",
+    "MOODENG",
+    "PNUT",
+    "GOAT",
+    "ACT",
+    "FARTCOIN",
 }
 
 
@@ -84,13 +114,25 @@ class UniverseService:
 
     market: CoinbaseClient
     size: int = 50
-    min_volume_usd: float = 15_000_000.0
+    min_volume_usd: float = 50_000_000.0
     refresh_hours: float = 6.0
     # Reject products whose quote tick alone is wider than this many bps of a
     # heuristic mid (quote_increment × 1e4 as synthetic mid when price unknown).
     max_tick_bps: float = 40.0
     min_ref_price: float = 1e-4
-    core: list[str] = field(default_factory=lambda: ["BTC-USD", "ETH-USD", "SOL-USD"])
+    core: list[str] = field(
+        default_factory=lambda: [
+            "BTC-USD",
+            "ETH-USD",
+            "SOL-USD",
+            "XRP-USD",
+            "LINK-USD",
+            "AVAX-USD",
+            "DOGE-USD",
+            "ADA-USD",
+            "HBAR-USD",
+        ]
+    )
     news_ttl_hours: float = 12.0
     rows: list[UniverseRow] = field(default_factory=list)
     symbols: list[str] = field(default_factory=list)
