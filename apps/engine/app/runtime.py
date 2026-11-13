@@ -12,6 +12,7 @@ from app.config import AlertParams, BotParams, LlmSettings
 from app.events import EventBus
 from app.lease import read_lease
 from app.execution import OrderPlan, buy_spend, cooldown_active, plan_protective, plan_signal
+from app.execution_idempotency import decision_fill_key, has_fill_key
 from app.fidelity import FillSample, FidelityTracker
 from app.fill_model import impact_bps_for_notional, quote_fill, walk_book_fill, walk_real_book
 from app.journal import DecisionJournal
@@ -22,6 +23,9 @@ from app.narrative import decision_narrative, format_other_exits, thresholds_fro
 from app.news.service import NewsService
 from app.equity_history import EquityHistory
 from app.persist import STATE_PATH, clear_state, load_state, parse_last_buys, save_state
+from app.push.subscriptions import send_web_push
+from app.reports.daily import PARIS, build_daily_report, digest_push_body, parse_paris_date
+from app.reports.performance import build_performance_metrics
 from app.risk import (
     annotate_levels,
     compute_exit_levels,
@@ -833,6 +837,10 @@ class TradingRuntime:
                 try:
                     await self.tick()
                     self.last_error = None
+                    try:
+                        await asyncio.to_thread(self.maybe_push_daily_digest)
+                    except Exception as push_exc:  # noqa: BLE001
+                        logger.warning("daily digest: %s", push_exc)
                 except (LeaseLost, PersistenceError) as exc:
                     self.last_error = str(exc)
                     logger.error("fail-closed: %s", exc)
@@ -1229,6 +1237,15 @@ class TradingRuntime:
         if getattr(q, "filled_notional", 0) and q.fill_price > 0:
             filled_qty = float(q.filled_notional) / q.fill_price
             qty = min(qty, filled_qty)
+        fill_key = decision_fill_key(
+            decision_ts=q.decision_ts,
+            symbol=symbol,
+            side="sell",
+            qty=qty,
+        )
+        if has_fill_key(self.wallet.trades, fill_key):
+            logger.info("duplicate_skip sell %s key=%s", symbol, fill_key)
+            return None
         try:
             trade = self.wallet.sell(
                 symbol,
@@ -1683,6 +1700,15 @@ class TradingRuntime:
             filled_spend = min(filled_spend, spend)
             qty = filled_spend / (fill * fee_mult)
             self._require_fill_authority()
+            fill_key = decision_fill_key(
+                decision_ts=q.decision_ts,
+                symbol=symbol,
+                side="buy",
+                qty=qty,
+            )
+            if has_fill_key(self.wallet.trades, fill_key):
+                logger.info("duplicate_skip buy %s key=%s", symbol, fill_key)
+                return None, OrderPlan("hold", 0.0, "duplicate_skip", "hold:duplicate_skip")
             try:
                 trade = self.wallet.buy(
                     symbol,
@@ -2472,6 +2498,63 @@ class TradingRuntime:
             "features": features,
             **self.status(),
         }
+
+
+    def daily_report(self, date_str: str | None = None) -> dict[str, Any]:
+        day = parse_paris_date(date_str)
+        prices = self.prices_map(refresh_open=self.lease is None)
+        journal_rows = [e.to_dict() for e in self.journal.entries[-200:]]
+        return build_daily_report(
+            day=day,
+            trades=list(self.wallet.trades),
+            positions=dict(self.wallet.positions),
+            prices=prices,
+            cash=float(self.wallet.cash),
+            unrealized_pnl=float(self.wallet.unrealized_pnl(prices)),
+            equity_points=self.equity_history.dump(),
+            fidelity=self.fidelity_report(),
+            killed=bool(self.killed),
+            kill_reason=self.kill_reason,
+            journal_entries=journal_rows,
+        )
+
+    def performance_metrics(self, range_key: str = "session") -> dict[str, Any]:
+        return build_performance_metrics(
+            trades=list(self.wallet.trades),
+            equity_points=self.equity_history.dump(),
+            fidelity=self.fidelity_report(),
+            range_key=range_key,
+            session_started_at=self.equity_history.session_started_at,
+        )
+
+    def maybe_push_daily_digest(self) -> dict[str, Any] | None:
+        """Owner-only: push once per Paris calendar day after 08:00."""
+        if self.lease is None or self.store is None:
+            return None
+        if not bool(getattr(self.params, "web_push_enabled", False)):
+            return None
+        now_paris = datetime.now(PARIS)
+        if now_paris.hour < 8:
+            return None
+        today = now_paris.date().isoformat()
+        try:
+            already = self.store.get_daily_report_pushed_on()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("daily push date read failed: %s", exc)
+            return None
+        if already == today:
+            return None
+        report = self.daily_report(today)
+        title = f"Bilan paper {today}"
+        body = digest_push_body(report)
+        result = send_web_push(title, body, url="/?tab=activity")
+        try:
+            self.store.set_daily_report_pushed_on(today)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("daily push date write failed: %s", exc)
+        logger.info("daily digest push date=%s result=%s", today, result)
+        return {"date": today, "push": result, "body": body}
+
 
     def account_state(self) -> dict[str, Any]:
         if self.lease is None and self.store is not None:

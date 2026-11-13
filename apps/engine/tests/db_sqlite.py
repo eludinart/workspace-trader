@@ -117,9 +117,17 @@ CREATE TABLE IF NOT EXISTS runtime_meta (
   reset_requested INTEGER NOT NULL DEFAULT 0,
   reset_balance REAL,
   close_requests TEXT NOT NULL DEFAULT '[]',
+  daily_report_pushed_on TEXT,
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 INSERT OR IGNORE INTO runtime_meta (id) VALUES (1);
+
+CREATE TABLE IF NOT EXISTS push_subscriptions (
+  endpoint TEXT PRIMARY KEY,
+  keys TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
 
 CREATE TABLE IF NOT EXISTS control_audit (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -136,6 +144,21 @@ def _adapt_sql_for_sqlite(sql: str) -> str:
     text = text.replace("CURRENT_TIMESTAMP", "datetime('now')")
     text = text.replace("now()", "datetime('now')")
     text = re.sub(r"\bEXCLUDED\b\.", "excluded.", text)
+    # Postgres advisory lock / cast helpers — no-ops or plain binds on SQLite.
+    text = re.sub(
+        r"SELECT\s+pg_advisory_xact_lock\s*\(\s*\?\s*\)",
+        "SELECT 1",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"SELECT\s+pg_advisory_xact_lock\s*\(\s*%s\s*\)",
+        "SELECT 1",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = text.replace("%s::date", "%s")
+    text = text.replace("?::date", "?")
     return text
 
 
@@ -182,6 +205,10 @@ class _SqliteCursor:
         return None
 
     def execute(self, sql: str, params: tuple[Any, ...] | None = None) -> None:
+        if "pg_advisory_xact_lock" in sql.lower():
+            # Postgres-only mutex — no-op under the SQLite test shim.
+            self._rows = [(1,)]
+            return
         adapted = _adapt_sql_for_sqlite(sql).replace("%s", "?")
         # SQLite UPSERT syntax uses excluded.* not EXCLUDED.*
         adapted = adapted.replace("EXCLUDED.", "excluded.")

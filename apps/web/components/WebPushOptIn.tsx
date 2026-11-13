@@ -24,7 +24,50 @@ export function WebPushOptIn() {
     const perm = Notification.permission;
     if (perm === "granted") {
       setStatus("granted");
-      setDetail("Permission accordée. Abonnement actif seulement si VAPID est configuré.");
+      setDetail("Permission accordée — synchronisation abonnement…");
+      void (async () => {
+        try {
+          const res = await fetch("/api/engine/push/vapid-public", { cache: "no-store" });
+          if (!res.ok) return;
+          const json = (await res.json()) as {
+            enabled?: boolean;
+            public_key?: string | null;
+            private_key_configured?: boolean;
+          };
+          if (!json.enabled || !json.public_key) {
+            setDetail("Permission OK — Web Push désactivé ou VAPID manquant.");
+            return;
+          }
+          const reg = await navigator.serviceWorker.ready;
+          let sub = await reg.pushManager.getSubscription();
+          if (!sub) {
+            sub = await reg.pushManager.subscribe({
+              userVisibleOnly: true,
+              applicationServerKey: urlBase64ToUint8Array(json.public_key),
+            });
+          }
+          const raw = sub.toJSON();
+          const endpoint = String(raw.endpoint || "");
+          const keys = {
+            p256dh: String(raw.keys?.p256dh || ""),
+            auth: String(raw.keys?.auth || ""),
+          };
+          if (endpoint && keys.p256dh && keys.auth) {
+            await fetch("/api/engine/push/subscribe", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ endpoint, keys }),
+            });
+          }
+          setDetail(
+            json.private_key_configured
+              ? "Abonnement push synchronisé (bilan 08:00 Paris)."
+              : "Abonnement sync — VAPID_PRIVATE_KEY manquante côté serveur.",
+          );
+        } catch {
+          setDetail("Permission accordée. Impossible de synchroniser l’abonnement.");
+        }
+      })();
     } else if (perm === "denied") {
       setStatus("denied");
       setDetail("Permission refusée dans le navigateur.");
@@ -70,13 +113,30 @@ export function WebPushOptIn() {
         setDetail("Clé publique OK mais clé privée absente côté serveur — abonnement incomplet.");
       }
       const reg = await navigator.serviceWorker.ready;
-      await reg.pushManager.subscribe({
+      const sub = await reg.pushManager.subscribe({
         userVisibleOnly: true,
         applicationServerKey: urlBase64ToUint8Array(vapid),
       });
+      const raw = sub.toJSON();
+      const endpoint = String(raw.endpoint || "");
+      const keys = {
+        p256dh: String(raw.keys?.p256dh || ""),
+        auth: String(raw.keys?.auth || ""),
+      };
+      if (endpoint && keys.p256dh && keys.auth) {
+        const save = await fetch("/api/engine/push/subscribe", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ endpoint, keys }),
+        });
+        if (!save.ok) {
+          const text = await save.text();
+          throw new Error(text || `HTTP ${save.status}`);
+        }
+      }
       setDetail(
         json.private_key_configured
-          ? "Abonnement push enregistré (VAPID)."
+          ? "Abonnement push enregistré sur le serveur (bilan 08:00 Paris)."
           : "Abonnement enregistré — complète VAPID_PRIVATE_KEY pour l’envoi serveur.",
       );
     } catch (err) {

@@ -559,6 +559,41 @@ class Store:
 
         return _with_deadlock_retry("set_kill", _once)
 
+    def get_daily_report_pushed_on(self) -> str | None:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT daily_report_pushed_on FROM runtime_meta WHERE id = %s",
+                    (_SINGLETON_ID,),
+                )
+                row = cur.fetchone()
+        if not row or row[0] is None:
+            return None
+        return str(row[0])
+
+    def set_daily_report_pushed_on(self, day_iso: str) -> None:
+        def _once() -> None:
+            with get_conn() as conn:
+                try:
+                    with conn.cursor() as cur:
+                        _lock_paper_book(cur)
+                        cur.execute(
+                            """
+                            INSERT INTO runtime_meta (id, daily_report_pushed_on, updated_at)
+                            VALUES (%s, %s::date, CURRENT_TIMESTAMP)
+                            ON CONFLICT (id) DO UPDATE SET
+                              daily_report_pushed_on = EXCLUDED.daily_report_pushed_on,
+                              updated_at = CURRENT_TIMESTAMP
+                            """,
+                            (_SINGLETON_ID, day_iso),
+                        )
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+                    raise
+
+        _with_deadlock_retry("set_daily_report_pushed_on", _once)
+
     def load_params(self) -> tuple[BotParams, AlertParams, LlmSettings]:
         with get_conn() as conn:
             with conn.cursor() as cur:

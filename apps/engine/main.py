@@ -24,6 +24,7 @@ from app.db import get_conn
 from app.lease import read_lease
 from app.migrate import run_migrations
 from app.news.models import NewsCategory
+from app.push.subscriptions import delete_subscription, upsert_subscription
 from app.push.vapid import vapid_public_key, web_push_status
 from app.runtime import LeaseLost, TradingRuntime
 from app.signals.confluence import score_confluence
@@ -491,6 +492,47 @@ def get_vapid_public() -> dict[str, Any]:
         "private_key_configured": status["private_key_configured"],
         "note": status["note"],
     }
+
+
+
+
+class PushSubscribeBody(BaseModel):
+    endpoint: str = Field(min_length=8)
+    keys: dict[str, Any] = Field(default_factory=dict)
+
+
+@app.post("/push/subscribe")
+def push_subscribe(body: PushSubscribeBody) -> dict[str, Any]:
+    flags = runtime.signal_flags()
+    if not flags.web_push_enabled:
+        raise HTTPException(status_code=400, detail="web_push_disabled")
+    try:
+        upsert_subscription(body.endpoint, body.keys)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return {"ok": True}
+
+
+@app.delete("/push/subscribe")
+def push_unsubscribe(body: PushSubscribeBody) -> dict[str, Any]:
+    deleted = delete_subscription(body.endpoint)
+    return {"ok": True, "deleted": deleted}
+
+
+@app.get("/reports/daily")
+def get_daily_report(date: str | None = None) -> dict[str, Any]:
+    try:
+        return runtime.daily_report(date)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/metrics/performance")
+def get_performance_metrics(range: str = "session") -> dict[str, Any]:
+    key = (range or "session").strip().lower()
+    if key not in {"session", "7d", "30d", "all"}:
+        raise HTTPException(status_code=400, detail="range must be session|7d|30d|all")
+    return runtime.performance_metrics(key)
 
 
 @app.get("/pnl")

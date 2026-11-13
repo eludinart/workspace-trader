@@ -182,6 +182,78 @@ export const api = {
   backtest: (body: Record<string, unknown>) =>
     engineFetch("/backtest", { method: "POST", body: JSON.stringify(body) }),
   lastBacktest: () => engineFetch("/backtest/last"),
+  dailyReport: (date?: string) => {
+    const qs = date ? `?date=${encodeURIComponent(date)}` : "";
+    return engineFetch(`/reports/daily${qs}`) as Promise<DailyReport>;
+  },
+  performanceMetrics: (range: "session" | "7d" | "30d" | "all" = "session") =>
+    engineFetch(`/metrics/performance?range=${encodeURIComponent(range)}`) as Promise<PerformanceMetrics>,
+  pushSubscribe: (endpoint: string, keys: Record<string, string>) =>
+    engineFetch("/push/subscribe", {
+      method: "POST",
+      body: JSON.stringify({ endpoint, keys }),
+    }) as Promise<{ ok: boolean }>,
+  pushUnsubscribe: (endpoint: string) =>
+    engineFetch("/push/subscribe", {
+      method: "DELETE",
+      body: JSON.stringify({ endpoint, keys: {} }),
+    }) as Promise<{ ok: boolean; deleted?: boolean }>,
+};
+
+export type DailyReport = {
+  date: string;
+  timezone: string;
+  realized: { pnl: number; sells: number; buys: number };
+  open: {
+    unrealized_pnl: number;
+    cash: number;
+    count: number;
+    positions: Array<{
+      symbol: string;
+      qty: number;
+      avg_entry: number;
+      mark: number;
+      unrealized_pnl: number;
+    }>;
+  };
+  fees: { total: number; trade_count: number };
+  failures: {
+    count: number;
+    twin_rejects: number;
+    twin_partials: number;
+    examples: Array<Record<string, unknown>>;
+  };
+  activity: {
+    symbols: string[];
+    trade_count: number;
+    killed: boolean;
+    kill_reason: string | null;
+  };
+  equity: {
+    start: number | null;
+    end: number | null;
+    max_drawdown_pct: number;
+    samples: number;
+  };
+};
+
+export type PerformanceMetrics = {
+  range: string;
+  win_rate: number;
+  wins: number;
+  losses: number;
+  avg_win: number;
+  avg_loss: number;
+  profit_factor: number | null;
+  profit_factor_infinite?: boolean;
+  net_realized_pnl: number;
+  fees_total: number;
+  max_drawdown_pct: number;
+  trades_per_day: number;
+  trade_count: number;
+  unfilled_rate: number;
+  reject_count: number;
+  partial_count: number;
 };
 
 export type NewsFetchResult = {

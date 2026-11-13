@@ -27,6 +27,10 @@ export type ChartTrade = {
   qty: number;
   ts: string;
   symbol?: string;
+  fee?: number | null;
+  realized_pnl?: number | null;
+  note?: string | null;
+  clamped?: boolean;
 };
 
 const W = 720;
@@ -80,6 +84,8 @@ function parseTrade(raw: Record<string, unknown>): ChartTrade | null {
   const qty = Number(raw.qty);
   const ts = String(raw.ts ?? "");
   if (!ts || !Number.isFinite(price) || !Number.isFinite(qty)) return null;
+  const fee = raw.fee != null ? Number(raw.fee) : null;
+  const realized = raw.realized_pnl != null ? Number(raw.realized_pnl) : null;
   return {
     id: String(raw.id ?? `${sideRaw}-${ts}-${price}`),
     side: sideRaw as "buy" | "sell",
@@ -87,6 +93,9 @@ function parseTrade(raw: Record<string, unknown>): ChartTrade | null {
     qty,
     ts,
     symbol: raw.symbol != null ? String(raw.symbol) : undefined,
+    fee: fee != null && Number.isFinite(fee) ? fee : null,
+    realized_pnl: realized != null && Number.isFinite(realized) ? realized : null,
+    note: raw.note != null ? String(raw.note) : null,
   };
 }
 
@@ -111,7 +120,15 @@ function nearestCandleIndex(timesMs: number[], targetMs: number): number {
 function tradeTitle(trade: ChartTrade): string {
   const when = new Date(trade.ts).toLocaleString("fr-FR");
   const side = trade.side === "buy" ? "ACHAT" : "VENTE";
-  return `${side} · ${trade.qty.toFixed(5)} @ ${trade.price.toFixed(2)} · ${when}`;
+  const bits = [
+    `${side} · ${trade.qty.toFixed(5)} @ ${trade.price.toFixed(2)}`,
+    when,
+  ];
+  if (trade.fee != null) bits.push(`frais ${trade.fee.toFixed(4)}`);
+  if (trade.realized_pnl != null) bits.push(`P&L ${trade.realized_pnl.toFixed(2)}`);
+  if (trade.note) bits.push(String(trade.note).slice(0, 48));
+  if (trade.clamped) bits.push("(hors fenêtre → bord)");
+  return bits.join(" · ");
 }
 
 function LegendChip({
@@ -261,7 +278,12 @@ export function PriceChart({ candles, trades = [], symbol, loading = false }: Pr
         const tsMs = timeMs(trade.ts);
         if (!Number.isFinite(tsMs)) return null;
         const candleIdx = nearestCandleIndex(candleTimesMs, tsMs);
-        if (candleIdx < offset) return null;
+        if (candleIdx < offset) {
+          return {
+            trade: { ...trade, clamped: true },
+            sliceIdx: 0,
+          };
+        }
         return {
           trade,
           sliceIdx: candleIdx - offset,
@@ -377,7 +399,14 @@ export function PriceChart({ candles, trades = [], symbol, loading = false }: Pr
           </span>
         </div>
       )}
-      <ChartToggles overlays={overlays} onChange={setOverlay} />
+      <div className="mb-2 flex flex-wrap items-center gap-2">
+        <ChartToggles overlays={overlays} onChange={setOverlay} />
+        {overlays.trades ? (
+          <span className="text-[10px] tabular-nums text-muted">
+            {tradeMarkers.length}/{normalizedTrades.length} trades visibles
+          </span>
+        ) : null}
+      </div>
 
       {showLegend && (
         <div className="mb-2 flex flex-wrap gap-1.5 sm:gap-2">

@@ -9,6 +9,7 @@ import { LiveEquity } from "@/components/LiveEquity";
 import { LiveOrders } from "@/components/LiveOrders";
 import { MobileAccountStrip } from "@/components/MobileAccountStrip";
 import { TradeFillRow } from "@/components/TradeFillRow";
+import { DailyDigestCard } from "@/components/DailyDigestCard";
 import { WebPushOptIn } from "@/components/WebPushOptIn";
 import type { AnnotatedTrade } from "@/lib/trade-display";
 import { NewsPanel } from "@/components/NewsPanel";
@@ -150,7 +151,14 @@ export function Dashboard() {
   const [systemStatusLoading, setSystemStatusLoading] = useState(true);
   const [universe, setUniverse] = useState<UniversePayload | null>(null);
   const [activity, setActivity] = useState<ActivityEvent[]>([]);
-  const [page, setPage] = useState<AppPage>("home");
+  const [page, setPage] = useState<AppPage>(() => {
+    if (typeof window === "undefined") return "home";
+    const tab = new URLSearchParams(window.location.search).get("tab");
+    if (tab === "activity" || tab === "orders" || tab === "config" || tab === "home") {
+      return tab;
+    }
+    return "home";
+  });
   const newsFromStreamRef = useRef(false);
   const chartSymbolRef = useRef(chartSymbol);
   chartSymbolRef.current = chartSymbol;
@@ -1317,7 +1325,8 @@ export function Dashboard() {
       ) : null}
 
       {page === "activity" ? (
-        <div className="mt-2">
+        <div className="mt-2 space-y-3">
+          <DailyDigestCard />
           <ActivityFeed events={activity} />
         </div>
       ) : null}
