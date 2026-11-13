@@ -259,11 +259,27 @@ class TradingRuntime:
                 raise LeaseLost("persist refused: lease not held")
         payload = self._state_payload()
         if self.store is not None:
-            try:
-                self.store.save_runtime(self)
-            except Exception as exc:  # noqa: BLE001
+            last_exc: Exception | None = None
+            for attempt in range(1, 4):
+                try:
+                    self.store.save_runtime(self)
+                    last_exc = None
+                    break
+                except Exception as exc:  # noqa: BLE001
+                    last_exc = exc
+                    msg = str(exc).lower()
+                    transient = "deadlock detected" in msg or "could not serialize" in msg
+                    if not transient or attempt >= 3:
+                        break
+                    logger.warning(
+                        "persist retry after transient DB error (attempt %s/3): %s",
+                        attempt,
+                        exc,
+                    )
+                    time.sleep(0.05 * attempt)
+            if last_exc is not None:
                 self._db_ok = False
-                raise PersistenceError("database persist failed") from exc
+                raise PersistenceError("database persist failed") from last_exc
             self._db_ok = True
             save_state(payload)
             return

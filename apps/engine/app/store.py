@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable, TypeVar
 
+from psycopg import errors as pg_errors
 from psycopg.types.json import Json
 
 from app.config import AlertParams, BotParams, LlmSettings
@@ -19,6 +21,43 @@ from app.wallet import PaperWallet, Position, Trade
 logger = logging.getLogger(__name__)
 
 _SINGLETON_ID = 1
+# Serialize writers that touch account / equity / book (API kill + trader persist).
+_PAPER_BOOK_LOCK_KEY = 87231401
+_DEADLOCK_RETRIES = 5
+_DEADLOCK_SLEEP_SEC = 0.05
+
+T = TypeVar("T")
+
+
+def _is_deadlock(exc: BaseException) -> bool:
+    if isinstance(exc, pg_errors.DeadlockDetected):
+        return True
+    msg = str(exc).lower()
+    return "deadlock detected" in msg
+
+
+def _with_deadlock_retry(label: str, fn: Callable[[], T]) -> T:
+    last: BaseException | None = None
+    for attempt in range(1, _DEADLOCK_RETRIES + 1):
+        try:
+            return fn()
+        except Exception as exc:  # noqa: BLE001
+            if not _is_deadlock(exc) or attempt >= _DEADLOCK_RETRIES:
+                raise
+            last = exc
+            logger.warning(
+                "%s deadlock (attempt %s/%s); retrying",
+                label,
+                attempt,
+                _DEADLOCK_RETRIES,
+            )
+            time.sleep(_DEADLOCK_SLEEP_SEC * attempt)
+    assert last is not None
+    raise last
+
+
+def _lock_paper_book(cur) -> None:
+    cur.execute("SELECT pg_advisory_xact_lock(%s)", (_PAPER_BOOK_LOCK_KEY,))
 
 
 def _utc_now() -> datetime:
@@ -243,40 +282,49 @@ class Store:
         return True
 
     def save_runtime(self, runtime: TradingRuntime) -> None:
-        with get_conn() as conn:
-            try:
-                with conn.cursor() as cur:
-                    self._upsert_account(cur, runtime)
-                    self._replace_positions(cur, runtime)
-                    self._replace_trades(cur, runtime)
-                    self._replace_journal(cur, runtime)
-                    self._replace_equity_points(cur, runtime)
-                    self._upsert_runtime_meta(cur, runtime)
-                conn.commit()
-            except Exception:
-                conn.rollback()
-                raise
+        def _once() -> None:
+            with get_conn() as conn:
+                try:
+                    with conn.cursor() as cur:
+                        _lock_paper_book(cur)
+                        self._upsert_account(cur, runtime)
+                        self._replace_positions(cur, runtime)
+                        self._replace_trades(cur, runtime)
+                        self._replace_journal(cur, runtime)
+                        self._replace_equity_points(cur, runtime)
+                        self._upsert_runtime_meta(cur, runtime)
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+                    raise
+
+        _with_deadlock_retry("save_runtime", _once)
 
     def save_equity_only(self, runtime: TradingRuntime) -> None:
         """Flush the equity ring buffer without rewriting the whole book."""
-        with get_conn() as conn:
-            try:
-                with conn.cursor() as cur:
-                    self._replace_equity_points(cur, runtime)
-                    # Keep session start aligned for chart windows.
-                    session_started = runtime.equity_history.session_started_at
-                    cur.execute(
-                        """
-                        UPDATE account
-                        SET session_started_at = %s, updated_at = CURRENT_TIMESTAMP
-                        WHERE id = %s
-                        """,
-                        (session_started, _SINGLETON_ID),
-                    )
-                conn.commit()
-            except Exception:
-                conn.rollback()
-                raise
+
+        def _once() -> None:
+            with get_conn() as conn:
+                try:
+                    with conn.cursor() as cur:
+                        _lock_paper_book(cur)
+                        # Lock account first (same order as save_runtime / set_kill).
+                        session_started = runtime.equity_history.session_started_at
+                        cur.execute(
+                            """
+                            UPDATE account
+                            SET session_started_at = %s, updated_at = CURRENT_TIMESTAMP
+                            WHERE id = %s
+                            """,
+                            (session_started, _SINGLETON_ID),
+                        )
+                        self._replace_equity_points(cur, runtime)
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+                    raise
+
+        _with_deadlock_retry("save_equity_only", _once)
 
     def save_params(
         self,
@@ -312,24 +360,29 @@ class Store:
 
     def request_reset(self, initial_balance: float | None) -> None:
         """Ask the lease owner to reset the paper book. Does not touch positions or trades."""
-        with get_conn() as conn:
-            try:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        """
-                        INSERT INTO runtime_meta (id, reset_requested, reset_balance, updated_at)
-                        VALUES (%s, %s, %s, CURRENT_TIMESTAMP)
-                        ON CONFLICT (id) DO UPDATE SET
-                          reset_requested = EXCLUDED.reset_requested,
-                          reset_balance = EXCLUDED.reset_balance,
-                          updated_at = CURRENT_TIMESTAMP
-                        """,
-                        (_SINGLETON_ID, True, initial_balance),
-                    )
-                conn.commit()
-            except Exception:
-                conn.rollback()
-                raise
+
+        def _once() -> None:
+            with get_conn() as conn:
+                try:
+                    with conn.cursor() as cur:
+                        _lock_paper_book(cur)
+                        cur.execute(
+                            """
+                            INSERT INTO runtime_meta (id, reset_requested, reset_balance, updated_at)
+                            VALUES (%s, %s, %s, CURRENT_TIMESTAMP)
+                            ON CONFLICT (id) DO UPDATE SET
+                              reset_requested = EXCLUDED.reset_requested,
+                              reset_balance = EXCLUDED.reset_balance,
+                              updated_at = CURRENT_TIMESTAMP
+                            """,
+                            (_SINGLETON_ID, True, initial_balance),
+                        )
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+                    raise
+
+        _with_deadlock_retry("request_reset", _once)
 
     def peek_reset_request(self) -> tuple[bool, float | None]:
         with get_conn() as conn:
@@ -349,21 +402,25 @@ class Store:
         return bool(requested), parsed
 
     def clear_reset_request(self) -> None:
-        with get_conn() as conn:
-            try:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        """
-                        UPDATE runtime_meta
-                        SET reset_requested=%s, reset_balance=NULL, updated_at=CURRENT_TIMESTAMP
-                        WHERE id=%s
-                        """,
-                        (False, _SINGLETON_ID),
-                    )
-                conn.commit()
-            except Exception:
-                conn.rollback()
-                raise
+        def _once() -> None:
+            with get_conn() as conn:
+                try:
+                    with conn.cursor() as cur:
+                        _lock_paper_book(cur)
+                        cur.execute(
+                            """
+                            UPDATE runtime_meta
+                            SET reset_requested=%s, reset_balance=NULL, updated_at=CURRENT_TIMESTAMP
+                            WHERE id=%s
+                            """,
+                            (False, _SINGLETON_ID),
+                        )
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+                    raise
+
+        _with_deadlock_retry("clear_reset_request", _once)
 
     @staticmethod
     def _parse_close_requests(raw: Any) -> list[str]:
@@ -393,32 +450,37 @@ class Store:
         sym = symbol.strip().upper()
         if not sym:
             return self.peek_close_requests()
-        with get_conn() as conn:
-            try:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        "SELECT close_requests FROM runtime_meta WHERE id = %s",
-                        (_SINGLETON_ID,),
-                    )
-                    row = cur.fetchone()
-                    pending = self._parse_close_requests(row[0] if row else None)
-                    if sym not in pending:
-                        pending.append(sym)
-                    cur.execute(
-                        """
-                        INSERT INTO runtime_meta (id, close_requests, updated_at)
-                        VALUES (%s, %s, CURRENT_TIMESTAMP)
-                        ON CONFLICT (id) DO UPDATE SET
-                          close_requests = EXCLUDED.close_requests,
-                          updated_at = CURRENT_TIMESTAMP
-                        """,
-                        (_SINGLETON_ID, Json(pending)),
-                    )
-                conn.commit()
-            except Exception:
-                conn.rollback()
-                raise
-        return pending
+
+        def _once() -> list[str]:
+            with get_conn() as conn:
+                try:
+                    with conn.cursor() as cur:
+                        _lock_paper_book(cur)
+                        cur.execute(
+                            "SELECT close_requests FROM runtime_meta WHERE id = %s",
+                            (_SINGLETON_ID,),
+                        )
+                        row = cur.fetchone()
+                        pending = self._parse_close_requests(row[0] if row else None)
+                        if sym not in pending:
+                            pending.append(sym)
+                        cur.execute(
+                            """
+                            INSERT INTO runtime_meta (id, close_requests, updated_at)
+                            VALUES (%s, %s, CURRENT_TIMESTAMP)
+                            ON CONFLICT (id) DO UPDATE SET
+                              close_requests = EXCLUDED.close_requests,
+                              updated_at = CURRENT_TIMESTAMP
+                            """,
+                            (_SINGLETON_ID, Json(pending)),
+                        )
+                    conn.commit()
+                    return pending
+                except Exception:
+                    conn.rollback()
+                    raise
+
+        return _with_deadlock_retry("enqueue_close", _once)
 
     def peek_close_requests(self) -> list[str]:
         with get_conn() as conn:
@@ -431,60 +493,71 @@ class Store:
         return self._parse_close_requests(row[0] if row else None)
 
     def clear_close_requests(self, symbols: list[str] | None = None) -> None:
-        with get_conn() as conn:
-            try:
-                with conn.cursor() as cur:
-                    if symbols is None:
-                        remaining: list[str] = []
-                    else:
-                        drop = {s.strip().upper() for s in symbols if s.strip()}
+        def _once() -> None:
+            with get_conn() as conn:
+                try:
+                    with conn.cursor() as cur:
+                        _lock_paper_book(cur)
+                        if symbols is None:
+                            remaining: list[str] = []
+                        else:
+                            drop = {s.strip().upper() for s in symbols if s.strip()}
+                            cur.execute(
+                                "SELECT close_requests FROM runtime_meta WHERE id = %s",
+                                (_SINGLETON_ID,),
+                            )
+                            row = cur.fetchone()
+                            remaining = [
+                                s
+                                for s in self._parse_close_requests(row[0] if row else None)
+                                if s not in drop
+                            ]
                         cur.execute(
-                            "SELECT close_requests FROM runtime_meta WHERE id = %s",
-                            (_SINGLETON_ID,),
+                            """
+                            UPDATE runtime_meta
+                            SET close_requests=%s, updated_at=CURRENT_TIMESTAMP
+                            WHERE id=%s
+                            """,
+                            (Json(remaining), _SINGLETON_ID),
                         )
-                        row = cur.fetchone()
-                        remaining = [
-                            s for s in self._parse_close_requests(row[0] if row else None) if s not in drop
-                        ]
-                    cur.execute(
-                        """
-                        UPDATE runtime_meta
-                        SET close_requests=%s, updated_at=CURRENT_TIMESTAMP
-                        WHERE id=%s
-                        """,
-                        (Json(remaining), _SINGLETON_ID),
-                    )
-                conn.commit()
-            except Exception:
-                conn.rollback()
-                raise
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+                    raise
+
+        _with_deadlock_retry("clear_close_requests", _once)
 
     def set_kill(self, killed: bool, kill_reason: str | None) -> bool:
         """Update kill flags only. Returns False when the account row does not exist."""
-        with get_conn() as conn:
-            try:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        """
-                        UPDATE account
-                        SET killed=%s, kill_reason=%s, updated_at=CURRENT_TIMESTAMP
-                        WHERE id=%s
-                        """,
-                        (killed, kill_reason, _SINGLETON_ID),
-                    )
-                    cur.execute(
-                        "SELECT killed FROM account WHERE id=%s",
-                        (_SINGLETON_ID,),
-                    )
-                    row = cur.fetchone()
-                if row is None:
+
+        def _once() -> bool:
+            with get_conn() as conn:
+                try:
+                    with conn.cursor() as cur:
+                        _lock_paper_book(cur)
+                        cur.execute(
+                            """
+                            UPDATE account
+                            SET killed=%s, kill_reason=%s, updated_at=CURRENT_TIMESTAMP
+                            WHERE id=%s
+                            """,
+                            (killed, kill_reason, _SINGLETON_ID),
+                        )
+                        cur.execute(
+                            "SELECT killed FROM account WHERE id=%s",
+                            (_SINGLETON_ID,),
+                        )
+                        row = cur.fetchone()
+                    if row is None:
+                        conn.rollback()
+                        return False
+                    conn.commit()
+                    return True
+                except Exception:
                     conn.rollback()
-                    return False
-                conn.commit()
-                return True
-            except Exception:
-                conn.rollback()
-                raise
+                    raise
+
+        return _with_deadlock_retry("set_kill", _once)
 
     def load_params(self) -> tuple[BotParams, AlertParams, LlmSettings]:
         with get_conn() as conn:
