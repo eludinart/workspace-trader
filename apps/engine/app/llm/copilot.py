@@ -27,6 +27,8 @@ Règles:
 - si confiance modèle ≥ 0.55 et pas de news très adverse: préférer approve, ou resize 0.5–0.75 plutôt que veto;
 - veto seulement si edge clairement < ~½ friction A/R (~95 bps) OU news clairement adverse OU book illiquide;
 - paper: laisser passer des setups moyens pour apprendre (évite le veto systématique);
+- force_exit INTERDIT si would_be_green=false et stop non touché: la perte n'est souvent que la friction A/R (~180 bps). Le hard-gate serveur ignore ces force_exit;
+- force_exit OK seulement si would_be_green=true (prendre un gain net) OU stop clairement atteint; respecte hold_min vs min_hold_min;
 répondre UNIQUEMENT en JSON compact:
 {"action":"approve|veto|resize|force_exit","size_mult":1.0,"reason_fr":"…"}
 reason_fr en français, max 200 caractères."""

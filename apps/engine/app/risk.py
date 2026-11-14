@@ -112,6 +112,38 @@ def sell_is_net_positive(
     return change >= cost + min_edge_frac
 
 
+def copilot_force_exit_allowed(
+    *,
+    avg_entry: float,
+    mark: float,
+    held_sec: float,
+    min_hold_sec: float,
+    stop_pct: float,
+    fee_bps: float,
+    slippage_bps: float,
+) -> tuple[bool, str]:
+    """Hard gates so LLM force_exit cannot fee-churn paper positions.
+
+    Allow only when the protective stop is hit, or when a sell would be net-green
+    after friction and min-hold has elapsed. Fee-only underwater marks are denied.
+    """
+    if avg_entry <= 0 or mark <= 0:
+        return False, "no_mark"
+    stop = max(0.0, float(stop_pct))
+    if stop > 0 and mark <= avg_entry * (1.0 - stop):
+        return True, "stop_hit"
+    if held_sec < max(0.0, float(min_hold_sec)):
+        return False, "min_hold"
+    if sell_is_net_positive(
+        avg_entry,
+        mark,
+        fee_bps=fee_bps,
+        slippage_bps=slippage_bps,
+    ):
+        return True, "net_green"
+    return False, "fee_underwater"
+
+
 def net_pnl_if_closed(
     avg_entry: float,
     qty: float,

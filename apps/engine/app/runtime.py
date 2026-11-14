@@ -29,6 +29,7 @@ from app.reports.performance import build_performance_metrics
 from app.risk import (
     annotate_levels,
     compute_exit_levels,
+    copilot_force_exit_allowed,
     dynamic_max_open,
     net_pnl_if_closed,
     portfolio_open_risk_r,
@@ -1322,6 +1323,28 @@ class TradingRuntime:
             dist_tp = ((tp_px - float(price)) / float(price)) * 100.0 if price else None
             dist_sl = ((float(price) - sl_px) / float(price)) * 100.0 if price else None
         rt_bps = round_trip_cost_frac(self.params.fee_bps, self.params.slippage_bps) * 10_000.0
+        hold_min = 0.0
+        last_buy = self._last_buy_at.get(symbol)
+        if last_buy is not None:
+            hold_min = max(
+                0.0,
+                (datetime.now(timezone.utc) - last_buy).total_seconds() / 60.0,
+            )
+        net_info = (
+            net_pnl_if_closed(
+                avg,
+                qty,
+                float(price),
+                fee_bps=float(self.params.fee_bps),
+                slippage_bps=float(self.params.slippage_bps),
+                cost_basis=float(pos.cost_basis) if pos is not None else None,
+            )
+            if pos is not None and qty > 0 and avg > 0
+            else {
+                "net_pnl": 0.0,
+                "would_be_green": False,
+            }
+        )
         return {
             "symbol": symbol,
             "side_proposed": side,
@@ -1334,6 +1357,10 @@ class TradingRuntime:
             "position_qty": qty,
             "avg_entry": avg,
             "u_pnl_pct": round(u_pnl_pct, 3),
+            "hold_min": round(hold_min, 2),
+            "min_hold_min": int(self.params.min_hold_min),
+            "net_pnl_if_closed": round(float(net_info.get("net_pnl") or 0.0), 4),
+            "would_be_green": bool(net_info.get("would_be_green")),
             "equity": round(equity, 2),
             "cash": round(float(self.wallet.cash), 2),
             "dist_tp_pct": None if dist_tp is None else round(dist_tp, 3),
@@ -1423,6 +1450,30 @@ class TradingRuntime:
                 continue
             if decision.action != "force_exit":
                 continue
+            last_buy = self._last_buy_at.get(sym)
+            held_sec = (
+                (datetime.now(timezone.utc) - last_buy).total_seconds()
+                if last_buy is not None
+                else 10_000.0
+            )
+            _take_pct, stop_pct = self._levels_for(sym)
+            allowed, gate_reason = copilot_force_exit_allowed(
+                avg_entry=float(pos.avg_entry),
+                mark=float(price),
+                held_sec=float(held_sec),
+                min_hold_sec=float(self.params.min_hold_min) * 60.0,
+                stop_pct=float(stop_pct),
+                fee_bps=float(self.params.fee_bps),
+                slippage_bps=float(self.params.slippage_bps),
+            )
+            if not allowed:
+                logger.info(
+                    "copilot force_exit blocked %s reason=%s held=%.0fs",
+                    sym,
+                    gate_reason,
+                    held_sec,
+                )
+                continue
             trade = self._sell_qty(sym, pos.qty, float(price), "exit:copilot")
             if trade is None:
                 continue
@@ -1443,6 +1494,7 @@ class TradingRuntime:
                     "price": trade.price,
                     "qty": trade.qty,
                     "copilot": decision.to_dict(),
+                    "gate": gate_reason,
                 }
             )
         return exits
@@ -1882,6 +1934,14 @@ class TradingRuntime:
             price=price,
         )
         copilot_snap = self._last_copilot_by_symbol.get(symbol)
+        if (
+            copilot_snap is not None
+            and copilot_snap.action == "force_exit"
+            and self.wallet.get_position(symbol) is None
+        ):
+            # Stale panic text after a flat book — do not pollute hold narratives.
+            self._last_copilot_by_symbol.pop(symbol, None)
+            copilot_snap = None
         if copilot_snap is not None and copilot_snap.reason_fr:
             bit = f"Co-pilote : {copilot_snap.reason_fr}"
             if bit not in narrative:
